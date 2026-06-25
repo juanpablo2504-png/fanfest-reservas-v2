@@ -378,6 +378,19 @@ def guardar_lista_invitados(reserva_id, df_invitados):
     conn.close()
 
 
+DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+def dia_abrev_es(fecha):
+    return DIAS_ES[fecha.weekday()]
+
+
+def fecha_dia_mes_es(fecha):
+    """Ej: '25 jun' — sin depender del locale del servidor."""
+    return f"{fecha.day} {MESES_ES[fecha.month - 1]}"
+
+
 # ----------------------------------------------------------------------------
 # CALENDARIO SEMÁFORO
 # ----------------------------------------------------------------------------
@@ -409,7 +422,7 @@ def render_calendario_semaforo(fecha_min, fecha_max):
             f"<div style='display:flex; align-items:center; gap:8px; padding:6px 12px; "
             f"margin-bottom:4px; border-radius:8px; background:{color}1A; border-left:4px solid {color};'>"
             f"<span style='font-size:1.1rem;'>{emoji}</span>"
-            f"<span style='font-weight:600; min-width:90px;'>{dia.strftime('%a %d/%m')}</span>"
+            f"<span style='font-weight:600; min-width:90px;'>{dia_abrev_es(dia)} {dia.strftime('%d/%m')}</span>"
             f"<span style='color:#444;'>{etiqueta}</span>"
             f"</div>"
         )
@@ -637,7 +650,7 @@ if pagina == "Solicitar reserva":
 
     st.caption(
         f"📌 Cupo de {capacidad_total} boletos por día · puedes solicitar entre "
-        f"{fecha_min.strftime('%d/%b')} y {fecha_max.strftime('%d/%b')} · "
+        f"{fecha_dia_mes_es(fecha_min)} y {fecha_dia_mes_es(fecha_max)} · "
         f"máximo {max_por_reserva} boletos por área, por día (entre todas tus solicitudes)."
     )
     st.info(
