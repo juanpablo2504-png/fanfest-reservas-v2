@@ -430,16 +430,31 @@ def obtener_invitados_consolidados(fecha_ini, fecha_fin):
 # CORREO DE CONFIRMACIÓN
 # ----------------------------------------------------------------------------
 
-def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad):
-    """Envía un correo de confirmación con el código de reserva.
-    Requiere las credenciales en st.secrets['email']. Si no están configuradas,
-    no rompe la app: simplemente no envía nada y avisa con un mensaje de retorno."""
+def _enviar_correo(destinatario, asunto, cuerpo):
+    """Función base de envío. Requiere las credenciales en st.secrets['email'].
+    Si no están configuradas, no rompe la app: solo avisa con un mensaje de retorno."""
     try:
         remitente = st.secrets["email"]["remitente"]
         password = st.secrets["email"]["password"]
     except Exception:
         return False, "El envío de correo no está configurado todavía (faltan credenciales en Secrets)."
 
+    mensaje = MIMEText(cuerpo, "plain", "utf-8")
+    mensaje["Subject"] = asunto
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+            servidor.login(remitente, password)
+            servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        return True, "Correo enviado."
+    except Exception as e:
+        return False, f"No se pudo enviar el correo: {e}"
+
+
+def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad):
+    """Correo enviado justo al recibir la solicitud (queda pendiente)."""
     cuerpo = (
         f"Hola {nombre},\n\n"
         "Recibimos tu solicitud de boletos para el Fan Fest.\n\n"
@@ -451,18 +466,39 @@ def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantid
         "y, si se aprueba, subir la lista detallada de tus invitados.\n\n"
         "Este es un correo automático, por favor no respondas a este mensaje."
     )
-    mensaje = MIMEText(cuerpo, "plain", "utf-8")
-    mensaje["Subject"] = f"Confirmación de tu solicitud - código {codigo}"
-    mensaje["From"] = remitente
-    mensaje["To"] = destinatario
+    return _enviar_correo(destinatario, f"Confirmación de tu solicitud - código {codigo}", cuerpo)
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
-            servidor.login(remitente, password)
-            servidor.sendmail(remitente, destinatario, mensaje.as_string())
-        return True, "Correo enviado."
-    except Exception as e:
-        return False, f"No se pudo enviar el correo: {e}"
+
+def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad, estado, motivo_rechazo=None):
+    """Correo enviado cuando el administrador aprueba o rechaza la solicitud."""
+    if estado == "aprobada":
+        asunto = f"¡Tu solicitud fue aprobada! - código {codigo}"
+        cuerpo = (
+            f"Hola {nombre},\n\n"
+            "¡Buenas noticias! Tu solicitud de boletos para el Fan Fest fue APROBADA.\n\n"
+            f"Código de reserva: {codigo}\n"
+            f"Fecha: {fecha}\n"
+            f"Área: {area}\n"
+            f"Cantidad de boletos: {cantidad}\n\n"
+            "Siguiente paso: entra a la app, ve a 'Mi reserva', pon tu código y sube la lista "
+            "detallada con el nombre completo de cada uno de tus invitados.\n\n"
+            "Este es un correo automático, por favor no respondas a este mensaje."
+        )
+    else:
+        asunto = f"Tu solicitud fue rechazada - código {codigo}"
+        motivo_texto = f"\n\nMotivo: {motivo_rechazo}" if motivo_rechazo else ""
+        cuerpo = (
+            f"Hola {nombre},\n\n"
+            "Lamentamos informarte que tu solicitud de boletos para el Fan Fest fue RECHAZADA.\n\n"
+            f"Código de reserva: {codigo}\n"
+            f"Fecha: {fecha}\n"
+            f"Área: {area}\n"
+            f"Cantidad de boletos: {cantidad}"
+            f"{motivo_texto}\n\n"
+            "Si tienes dudas, contacta al equipo organizador.\n\n"
+            "Este es un correo automático, por favor no respondas a este mensaje."
+        )
+    return _enviar_correo(destinatario, asunto, cuerpo)
 
 
 init_db()
@@ -518,7 +554,7 @@ if pagina == "Solicitar reserva":
     with col1:
         area_sel = st.selectbox("Área", areas_df["nombre"].tolist())
     with col2:
-        fecha_sel = st.date_input("Fecha", value=fecha_min, min_value=fecha_min, max_value=fecha_max)
+        fecha_sel = st.date_input("Fecha en la que quieres usar los boletos", value=fecha_min, min_value=fecha_min, max_value=fecha_max)
 
     aprobado_dia = reservado_aprobado_en(fecha_sel)
     disponible_dia = max(0, capacidad_total - aprobado_dia)
@@ -814,6 +850,11 @@ elif pagina == "Administración":
                             ok, msg = aprobar_reserva(int(row["id"]))
                             if ok:
                                 st.success(msg)
+                                if row.get("solicitante_correo"):
+                                    enviar_correo_resultado(
+                                        row["solicitante_correo"], row.get("solicitante_nombre") or "",
+                                        row["codigo"], row["fecha"], row["area"], row["cantidad"], "aprobada",
+                                    )
                             else:
                                 st.error(msg)
                             st.rerun()
@@ -821,6 +862,12 @@ elif pagina == "Administración":
                         motivo = st.text_input("Motivo de rechazo (opcional)", key=f"motivo_{row['id']}")
                         if st.button("❌ Rechazar", key=f"rechazar_{row['id']}"):
                             rechazar_reserva(int(row["id"]), motivo)
+                            if row.get("solicitante_correo"):
+                                enviar_correo_resultado(
+                                    row["solicitante_correo"], row.get("solicitante_nombre") or "",
+                                    row["codigo"], row["fecha"], row["area"], row["cantidad"], "rechazada",
+                                    motivo_rechazo=motivo,
+                                )
                             st.warning("Solicitud rechazada.")
                             st.rerun()
 
