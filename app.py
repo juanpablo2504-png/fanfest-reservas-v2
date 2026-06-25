@@ -10,6 +10,12 @@ from datetime import date, datetime, timedelta
 
 DB_PATH = "reservas.db"
 
+# Columnas por defecto de la lista de invitados (editable desde Administración)
+COLUMNAS_DEFAULT = [
+    {"nombre": "Nombre completo", "requerido": True},
+    {"nombre": "Teléfono o correo", "requerido": False},
+]
+
 st.set_page_config(page_title="Reservas Fan Fest", page_icon="🎫", layout="wide")
 
 # ----------------------------------------------------------------------------
@@ -97,6 +103,7 @@ def init_db():
         "min_dias_anticipacion": "0",
         "max_boletos_por_reserva": "10",
         "admin_password": "admin123",
+        "columnas_invitados": json.dumps(COLUMNAS_DEFAULT, ensure_ascii=False),
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO reglas (clave, valor) VALUES (?,?)", (k, v))
@@ -123,6 +130,20 @@ def set_rule(clave, valor):
     )
     conn.commit()
     conn.close()
+
+
+def get_columnas_invitados():
+    raw = get_rule("columnas_invitados")
+    if not raw:
+        return [dict(col) for col in COLUMNAS_DEFAULT]
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [dict(col) for col in COLUMNAS_DEFAULT]
+
+
+def set_columnas_invitados(columnas):
+    set_rule("columnas_invitados", json.dumps(columnas, ensure_ascii=False))
 
 
 def get_areas():
@@ -267,20 +288,13 @@ def guardar_lista_invitados(reserva_id, df_invitados):
 # EXCEL DE INVITADOS
 # ----------------------------------------------------------------------------
 
-COLUMNAS_PLANTILLA = ["#", "Nombre completo", "Teléfono o correo"]
-
-
 def generar_plantilla_excel(cantidad):
-    df = pd.DataFrame({
-        "#": list(range(1, cantidad + 1)),
-        "Nombre completo": ["" for _ in range(cantidad)],
-        "Teléfono o correo": ["" for _ in range(cantidad)],
-    })
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Invitados")
-    buffer.seek(0)
-    return buffer.getvalue()
+    columnas = get_columnas_invitados()
+    data = {"#": list(range(1, cantidad + 1))}
+    for col in columnas:
+        data[col["nombre"]] = ["" for _ in range(cantidad)]
+    df = pd.DataFrame(data)
+    return df_a_excel_bytes(df)
 
 
 def df_a_excel_bytes(df):
@@ -298,8 +312,15 @@ def validar_lista_invitados(archivo_subido, cantidad_esperada):
         return None, f"No pude leer el archivo: {e}"
 
     df.columns = [str(c).strip() for c in df.columns]
-    if "Nombre completo" not in df.columns:
-        return None, "El archivo debe tener una columna llamada 'Nombre completo'. Usa la plantilla descargada sin cambiarle los encabezados."
+    columnas = get_columnas_invitados()
+    requeridas = [c["nombre"] for c in columnas if c.get("requerido")]
+
+    faltantes = [c for c in requeridas if c not in df.columns]
+    if faltantes:
+        return None, (
+            f"Al archivo le falta la columna '{', '.join(faltantes)}'. "
+            "Usa la plantilla descargada sin cambiarle los encabezados."
+        )
 
     df = df.dropna(how="all").reset_index(drop=True)
 
@@ -309,12 +330,33 @@ def validar_lista_invitados(archivo_subido, cantidad_esperada):
             f"{len(df)} fila(s) de invitados. Deben coincidir exactamente."
         )
 
-    vacios = df["Nombre completo"].isna() | (df["Nombre completo"].astype(str).str.strip() == "")
-    if vacios.any():
-        filas = (vacios[vacios].index + 2).tolist()  # +2: encabezado + base 1
-        return None, f"Falta el nombre completo en la(s) fila(s) {filas} del Excel. Complétalo y vuelve a subirlo."
+    for columna in requeridas:
+        vacios = df[columna].isna() | (df[columna].astype(str).str.strip() == "")
+        if vacios.any():
+            filas = (vacios[vacios].index + 2).tolist()  # +2: encabezado + base 1
+            return None, f"Falta '{columna}' en la(s) fila(s) {filas} del Excel. Complétalo y vuelve a subirlo."
 
     return df, None
+
+
+def verificar_admin():
+    """Muestra el formulario de contraseña si no se ha iniciado sesión como admin.
+    Si la contraseña es correcta, marca la sesión como admin y continúa.
+    Si no, detiene la ejecución de la página actual."""
+    if "is_admin" not in st.session_state:
+        st.session_state.is_admin = False
+
+    if not st.session_state.is_admin:
+        st.title("🔒 Acceso de administrador")
+        pwd = st.text_input("Contraseña de administrador", type="password")
+        if st.button("Entrar"):
+            if pwd == get_rule("admin_password"):
+                st.session_state.is_admin = True
+                st.rerun()
+            else:
+                st.error("Contraseña incorrecta.")
+        st.caption("Contraseña por defecto: admin123 (cámbiala en Administración → Seguridad).")
+        st.stop()
 
 
 init_db()
@@ -324,7 +366,7 @@ init_db()
 # ----------------------------------------------------------------------------
 
 st.sidebar.title("🎫 Fan Fest")
-pagina = st.sidebar.radio("Ir a:", ["Solicitar reserva", "Mi reserva", "Dashboard", "Administración"])
+pagina = st.sidebar.radio("Ir a:", ["Solicitar reserva", "Mi reserva", "Dashboard 🔒", "Administración"])
 
 # ----------------------------------------------------------------------------
 # PÁGINA: SOLICITAR RESERVA
@@ -452,7 +494,7 @@ elif pagina == "Mi reserva":
                     if error:
                         st.error(error)
                     else:
-                        columnas_guardar = [c for c in ["Nombre completo", "Teléfono o correo"] if c in df_validado.columns]
+                        columnas_guardar = [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns]
                         guardar_lista_invitados(int(reserva["id"]), df_validado[columnas_guardar])
                         st.success("¡Lista de invitados recibida! Ya está todo listo. 🎉")
                         st.rerun()
@@ -461,7 +503,8 @@ elif pagina == "Mi reserva":
 # PÁGINA: DASHBOARD
 # ----------------------------------------------------------------------------
 
-elif pagina == "Dashboard":
+elif pagina == "Dashboard 🔒":
+    verificar_admin()
     st.title("📊 Dashboard de reservas")
 
     hoy = date.today()
@@ -534,24 +577,11 @@ elif pagina == "Dashboard":
 # ----------------------------------------------------------------------------
 
 elif pagina == "Administración":
+    verificar_admin()
     st.title("⚙️ Administración")
 
-    if "is_admin" not in st.session_state:
-        st.session_state.is_admin = False
-
-    if not st.session_state.is_admin:
-        pwd = st.text_input("Contraseña de administrador", type="password")
-        if st.button("Entrar"):
-            if pwd == get_rule("admin_password"):
-                st.session_state.is_admin = True
-                st.rerun()
-            else:
-                st.error("Contraseña incorrecta.")
-        st.caption("Contraseña por defecto: admin123 (cámbiala en la pestaña Seguridad).")
-        st.stop()
-
-    tab_solicitudes, tab_reglas, tab_areas, tab_reservas, tab_seguridad = st.tabs(
-        ["Solicitudes pendientes", "Reglas", "Áreas", "Reservas", "Seguridad"]
+    tab_solicitudes, tab_reglas, tab_areas, tab_plantilla, tab_reservas, tab_seguridad = st.tabs(
+        ["Solicitudes pendientes", "Reglas", "Áreas", "Plantilla invitados", "Reservas", "Seguridad"]
     )
 
     # --- Solicitudes pendientes ---
@@ -652,6 +682,74 @@ elif pagina == "Administración":
                     delete_area(area_id)
                     st.success("Área eliminada.")
                     st.rerun()
+
+    # --- Plantilla de invitados ---
+    with tab_plantilla:
+        st.subheader("Columnas de la lista de invitados")
+        st.caption(
+            "Estas son las columnas que la gente debe llenar al subir su lista de invitados "
+            "después de ser aprobados. La columna '#' siempre se agrega automáticamente para numerar."
+        )
+
+        columnas = get_columnas_invitados()
+        if columnas:
+            tabla = pd.DataFrame(columnas).rename(columns={"nombre": "Columna", "requerido": "Obligatoria"})
+            st.dataframe(tabla, hide_index=True, use_container_width=True)
+        else:
+            st.warning("No hay columnas configuradas todavía.")
+
+        st.markdown("**Agregar columna**")
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            nueva_col_nombre = st.text_input("Nombre de la columna", key="nueva_col_nombre")
+        with c2:
+            nueva_col_requerida = st.checkbox("Obligatoria", value=False, key="nueva_col_requerida")
+        with c3:
+            st.write("")
+            if st.button("Agregar columna"):
+                nombre_limpio = nueva_col_nombre.strip()
+                if not nombre_limpio:
+                    st.error("Escribe un nombre para la columna.")
+                elif nombre_limpio in [c["nombre"] for c in columnas]:
+                    st.error("Ya existe una columna con ese nombre.")
+                else:
+                    columnas.append({"nombre": nombre_limpio, "requerido": nueva_col_requerida})
+                    set_columnas_invitados(columnas)
+                    st.success("Columna agregada.")
+                    st.rerun()
+
+        if columnas:
+            st.markdown("**Marcar / desmarcar como obligatoria**")
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                col_editar = st.selectbox("Columna", [c["nombre"] for c in columnas], key="col_editar_sel")
+            with c2:
+                req_actual = next((c["requerido"] for c in columnas if c["nombre"] == col_editar), False)
+                nueva_req = st.checkbox("Obligatoria", value=req_actual, key="col_editar_req")
+            with c3:
+                st.write("")
+                if st.button("Actualizar"):
+                    for c in columnas:
+                        if c["nombre"] == col_editar:
+                            c["requerido"] = nueva_req
+                    set_columnas_invitados(columnas)
+                    st.success("Columna actualizada.")
+                    st.rerun()
+
+            st.markdown("**Quitar columna**")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                col_quitar = st.selectbox("Columna a quitar", [c["nombre"] for c in columnas], key="col_quitar_sel")
+            with c2:
+                st.write("")
+                if st.button("Quitar columna", type="secondary"):
+                    columnas_restantes = [c for c in columnas if c["nombre"] != col_quitar]
+                    if not columnas_restantes:
+                        st.error("Debe quedar al menos una columna.")
+                    else:
+                        set_columnas_invitados(columnas_restantes)
+                        st.success("Columna eliminada.")
+                        st.rerun()
 
     # --- Reservas ---
     with tab_reservas:
