@@ -6,6 +6,8 @@ import json
 import random
 import string
 import io
+import smtplib
+from email.mime.text import MIMEText
 from datetime import date, datetime, timedelta
 
 DB_PATH = "reservas.db"
@@ -15,6 +17,9 @@ COLUMNAS_DEFAULT = [
     {"nombre": "Nombre completo", "requerido": True},
     {"nombre": "Teléfono o correo", "requerido": False},
 ]
+
+# Campos por defecto del desglose inicial, antes de aprobar (editable desde Administración)
+CAMPOS_DESGLOSE_DEFAULT = ["Empresa"]
 
 st.set_page_config(page_title="Reservas Fan Fest", page_icon="🎫", layout="wide")
 
@@ -80,6 +85,7 @@ def init_db():
         ("lista_subida_en", "TEXT"),
         ("solicitante_nombre", "TEXT"),
         ("solicitante_correo", "TEXT"),
+        ("desglose_inicial", "TEXT"),
     ]:
         _add_column_if_missing(conn, "reservas", columna, tipo)
 
@@ -106,6 +112,7 @@ def init_db():
         "max_boletos_por_reserva": "10",
         "admin_password": "admin123",
         "columnas_invitados": json.dumps(COLUMNAS_DEFAULT, ensure_ascii=False),
+        "campos_desglose": json.dumps(CAMPOS_DESGLOSE_DEFAULT, ensure_ascii=False),
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO reglas (clave, valor) VALUES (?,?)", (k, v))
@@ -146,6 +153,20 @@ def get_columnas_invitados():
 
 def set_columnas_invitados(columnas):
     set_rule("columnas_invitados", json.dumps(columnas, ensure_ascii=False))
+
+
+def get_campos_desglose():
+    raw = get_rule("campos_desglose")
+    if not raw:
+        return list(CAMPOS_DESGLOSE_DEFAULT)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return list(CAMPOS_DESGLOSE_DEFAULT)
+
+
+def set_campos_desglose(campos):
+    set_rule("campos_desglose", json.dumps(campos, ensure_ascii=False))
 
 
 def get_areas():
@@ -202,16 +223,16 @@ def get_reserva_by_codigo(codigo):
     return df.iloc[0].to_dict()
 
 
-def add_reserva(fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo):
+def add_reserva(fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo, desglose_inicial):
     conn = get_conn()
     codigo = generar_codigo_unico(conn)
     c = conn.cursor()
     c.execute(
         "INSERT INTO reservas (fecha, area, cantidad, comentario, creado_en, estado, codigo, "
-        "solicitante_nombre, solicitante_correo) VALUES (?,?,?,?,?,?,?,?,?)",
+        "solicitante_nombre, solicitante_correo, desglose_inicial) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             str(fecha), area, cantidad, comentario, datetime.now().isoformat(), "pendiente", codigo,
-            solicitante_nombre, solicitante_correo,
+            solicitante_nombre, solicitante_correo, json.dumps(desglose_inicial, ensure_ascii=False),
         ),
     )
     conn.commit()
@@ -405,6 +426,45 @@ def obtener_invitados_consolidados(fecha_ini, fecha_fin):
     return pd.DataFrame(filas), faltantes
 
 
+# ----------------------------------------------------------------------------
+# CORREO DE CONFIRMACIÓN
+# ----------------------------------------------------------------------------
+
+def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad):
+    """Envía un correo de confirmación con el código de reserva.
+    Requiere las credenciales en st.secrets['email']. Si no están configuradas,
+    no rompe la app: simplemente no envía nada y avisa con un mensaje de retorno."""
+    try:
+        remitente = st.secrets["email"]["remitente"]
+        password = st.secrets["email"]["password"]
+    except Exception:
+        return False, "El envío de correo no está configurado todavía (faltan credenciales en Secrets)."
+
+    cuerpo = (
+        f"Hola {nombre},\n\n"
+        "Recibimos tu solicitud de boletos para el Fan Fest.\n\n"
+        f"Código de reserva: {codigo}\n"
+        f"Fecha: {fecha}\n"
+        f"Área: {area}\n"
+        f"Cantidad de boletos: {cantidad}\n\n"
+        "Guarda este código: lo vas a necesitar para consultar el estado de tu solicitud "
+        "y, si se aprueba, subir la lista detallada de tus invitados.\n\n"
+        "Este es un correo automático, por favor no respondas a este mensaje."
+    )
+    mensaje = MIMEText(cuerpo, "plain", "utf-8")
+    mensaje["Subject"] = f"Confirmación de tu solicitud - código {codigo}"
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+            servidor.login(remitente, password)
+            servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        return True, "Correo enviado."
+    except Exception as e:
+        return False, f"No se pudo enviar el correo: {e}"
+
+
 init_db()
 
 # ----------------------------------------------------------------------------
@@ -493,21 +553,74 @@ if pagina == "Solicitar reserva":
                 f"({disponible_dia}). Puedes enviar tu solicitud, pero podría rechazarse por falta de cupo."
             )
 
-        comentario = st.text_input("Nota / responsable (opcional)")
+        # --- Desglose: ¿para quién son los boletos? ---
+        contexto_actual = f"{area_sel}|{fecha_sel}|{cantidad}"
+        if st.session_state.get("desglose_contexto") != contexto_actual:
+            st.session_state.desglose_contexto = contexto_actual
+            st.session_state.desglose_grupos = []
 
-        if st.button("Enviar solicitud", type="primary"):
-            nombre_limpio = solicitante_nombre.strip()
-            correo_limpio = solicitante_correo.strip()
-            if not nombre_limpio:
-                st.error("Escribe tu nombre completo.")
-            elif "@" not in correo_limpio or "." not in correo_limpio:
-                st.error("Escribe un correo electrónico válido.")
-            else:
-                codigo = add_reserva(fecha_sel, area_sel, cantidad, comentario, nombre_limpio, correo_limpio)
-                st.success(
-                    f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
-                    "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
+        asignado = sum(g["Boletos"] for g in st.session_state.desglose_grupos)
+        faltan = cantidad - asignado
+
+        st.divider()
+        st.markdown("**¿Para quién son estos boletos?**")
+        st.caption(f"De los {cantidad} boletos, llevas asignados **{asignado}**. Faltan **{faltan}**.")
+
+        if st.session_state.desglose_grupos:
+            st.dataframe(pd.DataFrame(st.session_state.desglose_grupos), hide_index=True, use_container_width=True)
+            if st.button("↩️ Quitar el último grupo agregado"):
+                st.session_state.desglose_grupos.pop()
+                st.rerun()
+
+        campos_desglose = get_campos_desglose()
+
+        if faltan > 0:
+            with st.form("form_grupo_desglose", clear_on_submit=True):
+                valores_campos = {}
+                for campo in campos_desglose:
+                    valores_campos[campo] = st.text_input(campo)
+                boletos_grupo = st.number_input(
+                    "Boletos para este grupo", min_value=1, max_value=faltan, value=min(faltan, 1)
                 )
+                agregar = st.form_submit_button("Agregar grupo")
+                if agregar:
+                    if any(not v.strip() for v in valores_campos.values()):
+                        st.error("Completa todos los campos del grupo.")
+                    else:
+                        nuevo_grupo = {campo: valor.strip() for campo, valor in valores_campos.items()}
+                        nuevo_grupo["Boletos"] = int(boletos_grupo)
+                        st.session_state.desglose_grupos.append(nuevo_grupo)
+                        st.rerun()
+        else:
+            st.success("✅ Ya asignaste los boletos completos. Puedes continuar.")
+
+            comentario = st.text_input("Nota (opcional)")
+
+            if st.button("Enviar solicitud", type="primary"):
+                nombre_limpio = solicitante_nombre.strip()
+                correo_limpio = solicitante_correo.strip()
+                if not nombre_limpio:
+                    st.error("Escribe tu nombre completo.")
+                elif "@" not in correo_limpio or "." not in correo_limpio:
+                    st.error("Escribe un correo electrónico válido.")
+                else:
+                    codigo = add_reserva(
+                        fecha_sel, area_sel, cantidad, comentario, nombre_limpio, correo_limpio,
+                        st.session_state.desglose_grupos,
+                    )
+                    enviado, _ = enviar_correo_confirmacion(
+                        correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad
+                    )
+                    st.success(
+                        f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
+                        "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
+                    )
+                    if enviado:
+                        st.caption(f"📧 Te enviamos un correo de confirmación a {correo_limpio}.")
+                    else:
+                        st.caption("No pudimos enviarte un correo de confirmación, pero tu código sigue siendo válido — guárdalo de todos modos.")
+                    st.session_state.desglose_grupos = []
+                    st.session_state.desglose_contexto = None
 
 # ----------------------------------------------------------------------------
 # PÁGINA: MI RESERVA
@@ -661,7 +774,7 @@ elif pagina == "Administración":
     st.title("⚙️ Administración")
 
     tab_solicitudes, tab_reglas, tab_areas, tab_plantilla, tab_reservas, tab_respaldo, tab_seguridad = st.tabs(
-        ["Solicitudes pendientes", "Reglas", "Áreas", "Plantilla invitados", "Reservas", "Respaldo y exportar", "Seguridad"]
+        ["Solicitudes pendientes", "Reglas", "Áreas", "Formularios", "Reservas", "Respaldo y exportar", "Seguridad"]
     )
 
     # --- Solicitudes pendientes ---
@@ -684,6 +797,16 @@ elif pagina == "Administración":
                     st.caption(f"Solicitante: {row.get('solicitante_nombre') or '—'} · {row.get('solicitante_correo') or '—'}")
                     if row["comentario"]:
                         st.caption(f"Nota: {row['comentario']}")
+
+                    desglose_raw = row.get("desglose_inicial")
+                    if isinstance(desglose_raw, str) and desglose_raw.strip():
+                        try:
+                            desglose = json.loads(desglose_raw)
+                        except json.JSONDecodeError:
+                            desglose = []
+                        if desglose:
+                            st.write("Desglose declarado por el solicitante:")
+                            st.dataframe(pd.DataFrame(desglose), hide_index=True, use_container_width=True)
 
                     colA, colB = st.columns(2)
                     with colA:
@@ -766,6 +889,53 @@ elif pagina == "Administración":
 
     # --- Plantilla de invitados ---
     with tab_plantilla:
+        st.subheader("Desglose inicial (al solicitar, antes de aprobar)")
+        st.caption(
+            "Estos son los campos que la persona debe llenar grupo por grupo al solicitar boletos "
+            "(ej. 'Empresa'), antes de mandar la solicitud. El campo 'Boletos' siempre se incluye automáticamente."
+        )
+
+        campos_desglose = get_campos_desglose()
+        if campos_desglose:
+            st.dataframe(pd.DataFrame({"Campo": campos_desglose}), hide_index=True, use_container_width=True)
+        else:
+            st.warning("No hay campos configurados todavía.")
+
+        st.markdown("**Agregar campo**")
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            nuevo_campo_nombre = st.text_input("Nombre del campo", key="nuevo_campo_desglose")
+        with c2:
+            st.write("")
+            if st.button("Agregar campo"):
+                nombre_limpio = nuevo_campo_nombre.strip()
+                if not nombre_limpio:
+                    st.error("Escribe un nombre para el campo.")
+                elif nombre_limpio in campos_desglose:
+                    st.error("Ya existe un campo con ese nombre.")
+                else:
+                    campos_desglose.append(nombre_limpio)
+                    set_campos_desglose(campos_desglose)
+                    st.success("Campo agregado.")
+                    st.rerun()
+
+        if campos_desglose:
+            st.markdown("**Quitar campo**")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                campo_quitar = st.selectbox("Campo a quitar", campos_desglose, key="campo_quitar_desglose")
+            with c2:
+                st.write("")
+                if st.button("Quitar campo", type="secondary"):
+                    campos_restantes = [c for c in campos_desglose if c != campo_quitar]
+                    if not campos_restantes:
+                        st.error("Debe quedar al menos un campo.")
+                    else:
+                        set_campos_desglose(campos_restantes)
+                        st.success("Campo eliminado.")
+                        st.rerun()
+
+        st.divider()
         st.subheader("Columnas de la lista de invitados")
         st.caption(
             "Estas son las columnas que la gente debe llenar al subir su lista de invitados "
@@ -863,6 +1033,16 @@ elif pagina == "Administración":
             st.caption(f"Solicitante: {fila.get('solicitante_nombre') or '—'} · {fila.get('solicitante_correo') or '—'}")
             if fila["estado"] == "rechazada" and fila.get("motivo_rechazo"):
                 st.caption(f"Motivo de rechazo: {fila['motivo_rechazo']}")
+
+            desglose_raw = fila.get("desglose_inicial")
+            if isinstance(desglose_raw, str) and desglose_raw.strip():
+                try:
+                    desglose = json.loads(desglose_raw)
+                except json.JSONDecodeError:
+                    desglose = []
+                if desglose:
+                    st.write("Desglose declarado por el solicitante:")
+                    st.dataframe(pd.DataFrame(desglose), hide_index=True, use_container_width=True)
 
             lista_raw = fila.get("lista_invitados")
             if isinstance(lista_raw, str) and lista_raw.strip():
