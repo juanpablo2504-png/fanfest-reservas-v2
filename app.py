@@ -15,7 +15,17 @@ DB_PATH = "reservas.db"
 # Columnas por defecto de la lista de invitados (editable desde Administración)
 COLUMNAS_DEFAULT = [
     {"nombre": "Nombre completo", "requerido": True},
-    {"nombre": "Teléfono o correo", "requerido": False},
+    {"nombre": "Correo electrónico", "requerido": True},
+    {"nombre": "Teléfono", "requerido": True},
+    {"nombre": "Empresa", "requerido": True},
+    {"nombre": "Puesto", "requerido": True},
+]
+
+# Áreas por defecto (editable desde Administración → Áreas)
+AREAS_DEFAULT = [
+    "Comercial", "Legal y Finanzas", "CES", "MKT", "Capital Humano", "Arrendadoras",
+    "Fundación", "Inter.mx", "Beneficios", "Premium", "Middle Market", "Especialidades",
+    "Reasinter", "Alianzas", "Técnico", "Siniestros", "Servicios Generales", "Otro",
 ]
 
 # Campos por defecto del desglose inicial, antes de aprobar (editable desde Administración)
@@ -101,7 +111,7 @@ def init_db():
     if c.fetchone()[0] == 0:
         c.executemany(
             "INSERT INTO areas (nombre, capacidad_diaria) VALUES (?, 0)",
-            [("General",), ("VIP",), ("Staff/Prensa",)],
+            [(nombre,) for nombre in AREAS_DEFAULT],
         )
 
     # Reglas por defecto
@@ -113,6 +123,7 @@ def init_db():
         "admin_password": "admin123",
         "columnas_invitados": json.dumps(COLUMNAS_DEFAULT, ensure_ascii=False),
         "campos_desglose": json.dumps(CAMPOS_DESGLOSE_DEFAULT, ensure_ascii=False),
+        "dias_bloqueados": "[]",
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO reglas (clave, valor) VALUES (?,?)", (k, v))
@@ -169,6 +180,29 @@ def set_campos_desglose(campos):
     set_rule("campos_desglose", json.dumps(campos, ensure_ascii=False))
 
 
+def get_dias_bloqueados():
+    raw = get_rule("dias_bloqueados")
+    if not raw:
+        return []
+    try:
+        return sorted(json.loads(raw))
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def bloquear_dia(fecha):
+    dias = get_dias_bloqueados()
+    fecha_str = str(fecha)
+    if fecha_str not in dias:
+        dias.append(fecha_str)
+        set_rule("dias_bloqueados", json.dumps(sorted(dias), ensure_ascii=False))
+
+
+def desbloquear_dia(fecha):
+    dias = [d for d in get_dias_bloqueados() if d != str(fecha)]
+    set_rule("dias_bloqueados", json.dumps(dias, ensure_ascii=False))
+
+
 def get_areas():
     conn = get_conn()
     df = pd.read_sql_query("SELECT * FROM areas ORDER BY nombre", conn)
@@ -188,6 +222,23 @@ def delete_area(area_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM areas WHERE id=?", (area_id,))
+    conn.commit()
+    conn.close()
+
+
+def reemplazar_areas(lista_nombres):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM areas")
+    nombres_unicos = []
+    for nombre in lista_nombres:
+        nombre_limpio = nombre.strip()
+        if nombre_limpio and nombre_limpio not in nombres_unicos:
+            nombres_unicos.append(nombre_limpio)
+    c.executemany(
+        "INSERT INTO areas (nombre, capacidad_diaria) VALUES (?, 0)",
+        [(nombre,) for nombre in nombres_unicos],
+    )
     conn.commit()
     conn.close()
 
@@ -286,6 +337,9 @@ def aprobar_reserva(reserva_id):
     if estado != "pendiente":
         conn.close()
         return False, "Esta solicitud ya fue revisada."
+    if str(fecha) in get_dias_bloqueados():
+        conn.close()
+        return False, f"El día {fecha} está bloqueado por el organizador. No se puede aprobar."
     capacidad_total = int(get_rule("capacidad_diaria_total", 70))
     aprobado_actual = reservado_aprobado_en(fecha)
     disponible = capacidad_total - aprobado_actual
@@ -322,6 +376,46 @@ def guardar_lista_invitados(reserva_id, df_invitados):
     )
     conn.commit()
     conn.close()
+
+
+# ----------------------------------------------------------------------------
+# CALENDARIO SEMÁFORO
+# ----------------------------------------------------------------------------
+
+def estado_color_dia(disponible, capacidad_total, bloqueado):
+    """Devuelve (emoji, color_hex, etiqueta) según disponibilidad del día."""
+    if bloqueado:
+        return "🔴", "#e03131", "Bloqueado por el organizador"
+    if disponible <= 0:
+        return "🔴", "#e03131", "Sin cupo"
+    proporcion = disponible / capacidad_total if capacidad_total else 0
+    if proporcion <= 0.3:
+        return "🟡", "#f59f00", f"{disponible} disponibles (poca disponibilidad)"
+    return "🟢", "#2f9e44", f"{disponible} disponibles"
+
+
+def render_calendario_semaforo(fecha_min, fecha_max):
+    capacidad_total = int(get_rule("capacidad_diaria_total", 70))
+    dias_bloqueados = get_dias_bloqueados()
+
+    filas_html = []
+    dia = fecha_min
+    while dia <= fecha_max:
+        bloqueado = str(dia) in dias_bloqueados
+        aprobado = reservado_aprobado_en(dia)
+        disponible = max(0, capacidad_total - aprobado)
+        emoji, color, etiqueta = estado_color_dia(disponible, capacidad_total, bloqueado)
+        filas_html.append(
+            f"<div style='display:flex; align-items:center; gap:8px; padding:6px 12px; "
+            f"margin-bottom:4px; border-radius:8px; background:{color}1A; border-left:4px solid {color};'>"
+            f"<span style='font-size:1.1rem;'>{emoji}</span>"
+            f"<span style='font-weight:600; min-width:90px;'>{dia.strftime('%a %d/%m')}</span>"
+            f"<span style='color:#444;'>{etiqueta}</span>"
+            f"</div>"
+        )
+        dia += timedelta(days=1)
+
+    st.markdown("".join(filas_html), unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------
@@ -464,9 +558,18 @@ def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantid
         f"Cantidad de boletos: {cantidad}\n\n"
         "Guarda este código: lo vas a necesitar para consultar el estado de tu solicitud "
         "y, si se aprueba, subir la lista detallada de tus invitados.\n\n"
+        f"{PIE_CONTACTO}\n\n"
         "Este es un correo automático, por favor no respondas a este mensaje."
     )
     return _enviar_correo(destinatario, f"Confirmación de tu solicitud - código {codigo}", cuerpo)
+
+
+PIE_CONTACTO = (
+    "Para cualquier duda, contacta a:\n"
+    "Margarita Escobedo: aega@inter.mx\n"
+    "Juan Pablo Muniain: jpma@inter.mx\n"
+    "Alejandro Romano: alrf@inter.mx"
+)
 
 
 def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad, estado, motivo_rechazo=None):
@@ -482,6 +585,7 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
             f"Cantidad de boletos: {cantidad}\n\n"
             "Siguiente paso: entra a la app, ve a 'Mi reserva', pon tu código y sube la lista "
             "detallada con el nombre completo de cada uno de tus invitados.\n\n"
+            f"{PIE_CONTACTO}\n\n"
             "Este es un correo automático, por favor no respondas a este mensaje."
         )
     else:
@@ -495,7 +599,7 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
             f"Área: {area}\n"
             f"Cantidad de boletos: {cantidad}"
             f"{motivo_texto}\n\n"
-            "Si tienes dudas, contacta al equipo organizador.\n\n"
+            f"{PIE_CONTACTO}\n\n"
             "Este es un correo automático, por favor no respondas a este mensaje."
         )
     return _enviar_correo(destinatario, asunto, cuerpo)
@@ -542,6 +646,9 @@ if pagina == "Solicitar reserva":
         "subir ahí la lista de tus invitados."
     )
 
+    st.markdown("**Disponibilidad por día**")
+    render_calendario_semaforo(fecha_min, fecha_max)
+
     st.markdown("**Tus datos**")
     col_nombre, col_correo = st.columns(2)
     with col_nombre:
@@ -556,107 +663,115 @@ if pagina == "Solicitar reserva":
     with col2:
         fecha_sel = st.date_input("Fecha en la que quieres usar los boletos", value=fecha_min, min_value=fecha_min, max_value=fecha_max)
 
+    dia_bloqueado = str(fecha_sel) in get_dias_bloqueados()
     aprobado_dia = reservado_aprobado_en(fecha_sel)
     disponible_dia = max(0, capacidad_total - aprobado_dia)
-    st.info(
-        f"Boletos ya **aprobados** para el **{fecha_sel.strftime('%d/%m/%Y')}**: "
-        f"**{aprobado_dia}** de {capacidad_total} · quedan **{disponible_dia}** disponibles "
-        "(las solicitudes pendientes de otras personas todavía no se han restado)."
-    )
 
-    ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
-    restante_area_dia = max(0, max_por_reserva - ya_area_dia)
-
-    st.info(
-        f"El área **{area_sel}** ya tiene **{ya_area_dia}** de **{max_por_reserva}** boletos "
-        f"solicitados/aprobados para el {fecha_sel.strftime('%d/%m/%Y')} "
-        "(sumando solicitudes pendientes y aprobadas)."
-    )
-
-    if restante_area_dia == 0:
+    if dia_bloqueado:
         st.error(
-            f"El área **{area_sel}** ya alcanzó el máximo de boletos permitido para este día. "
-            "No se pueden enviar más solicitudes para esta combinación de área y fecha."
+            f"📅 El **{fecha_sel.strftime('%d/%m/%Y')}** está bloqueado por el equipo organizador. "
+            "No se aceptan solicitudes para esta fecha."
+        )
+    elif disponible_dia == 0:
+        st.error(
+            f"El **{fecha_sel.strftime('%d/%m/%Y')}** ya alcanzó el cupo total de {capacidad_total} boletos. "
+            "No se pueden enviar más solicitudes para esta fecha."
         )
     else:
-        if restante_area_dia < max_por_reserva:
-            st.caption(f"Como ya tiene {ya_area_dia} en juego, esta solicitud puede ser de hasta {restante_area_dia} boletos.")
+        st.info(
+            f"Boletos ya **aprobados** para el **{fecha_sel.strftime('%d/%m/%Y')}**: "
+            f"**{aprobado_dia}** de {capacidad_total} · quedan **{disponible_dia}** disponibles."
+        )
 
-        cantidad = st.number_input("Cantidad de boletos", min_value=1, max_value=restante_area_dia, value=1, step=1)
-        if cantidad > disponible_dia:
-            st.warning(
-                f"Ojo: estás pidiendo más boletos ({cantidad}) que los disponibles según lo ya aprobado "
-                f"({disponible_dia}). Puedes enviar tu solicitud, pero podría rechazarse por falta de cupo."
+        ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
+        restante_area_dia = max(0, max_por_reserva - ya_area_dia)
+
+        st.info(
+            f"El área **{area_sel}** ya tiene **{ya_area_dia}** de **{max_por_reserva}** boletos "
+            f"solicitados/aprobados para el {fecha_sel.strftime('%d/%m/%Y')} "
+            "(sumando solicitudes pendientes y aprobadas)."
+        )
+
+        if restante_area_dia == 0:
+            st.error(
+                f"El área **{area_sel}** ya alcanzó el máximo de boletos permitido para este día. "
+                "No se pueden enviar más solicitudes para esta combinación de área y fecha."
             )
-
-        # --- Desglose: ¿para quién son los boletos? ---
-        contexto_actual = f"{area_sel}|{fecha_sel}|{cantidad}"
-        if st.session_state.get("desglose_contexto") != contexto_actual:
-            st.session_state.desglose_contexto = contexto_actual
-            st.session_state.desglose_grupos = []
-
-        asignado = sum(g["Boletos"] for g in st.session_state.desglose_grupos)
-        faltan = cantidad - asignado
-
-        st.divider()
-        st.markdown("**¿Para quién son estos boletos?**")
-        st.caption(f"De los {cantidad} boletos, llevas asignados **{asignado}**. Faltan **{faltan}**.")
-
-        if st.session_state.desglose_grupos:
-            st.dataframe(pd.DataFrame(st.session_state.desglose_grupos), hide_index=True, use_container_width=True)
-            if st.button("↩️ Quitar el último grupo agregado"):
-                st.session_state.desglose_grupos.pop()
-                st.rerun()
-
-        campos_desglose = get_campos_desglose()
-
-        if faltan > 0:
-            with st.form("form_grupo_desglose", clear_on_submit=True):
-                valores_campos = {}
-                for campo in campos_desglose:
-                    valores_campos[campo] = st.text_input(campo)
-                boletos_grupo = st.number_input(
-                    "Boletos para este grupo", min_value=1, max_value=faltan, value=min(faltan, 1)
-                )
-                agregar = st.form_submit_button("Agregar grupo")
-                if agregar:
-                    if any(not v.strip() for v in valores_campos.values()):
-                        st.error("Completa todos los campos del grupo.")
-                    else:
-                        nuevo_grupo = {campo: valor.strip() for campo, valor in valores_campos.items()}
-                        nuevo_grupo["Boletos"] = int(boletos_grupo)
-                        st.session_state.desglose_grupos.append(nuevo_grupo)
-                        st.rerun()
         else:
-            st.success("✅ Ya asignaste los boletos completos. Puedes continuar.")
+            tope_cantidad = min(restante_area_dia, disponible_dia)
+            if tope_cantidad < max_por_reserva:
+                st.caption(f"Por la disponibilidad de hoy, esta solicitud puede ser de hasta {tope_cantidad} boletos.")
 
-            comentario = st.text_input("Nota (opcional)")
+            cantidad = st.number_input("Cantidad de boletos", min_value=1, max_value=tope_cantidad, value=1, step=1)
 
-            if st.button("Enviar solicitud", type="primary"):
-                nombre_limpio = solicitante_nombre.strip()
-                correo_limpio = solicitante_correo.strip()
-                if not nombre_limpio:
-                    st.error("Escribe tu nombre completo.")
-                elif "@" not in correo_limpio or "." not in correo_limpio:
-                    st.error("Escribe un correo electrónico válido.")
-                else:
-                    codigo = add_reserva(
-                        fecha_sel, area_sel, cantidad, comentario, nombre_limpio, correo_limpio,
-                        st.session_state.desglose_grupos,
+            # --- Desglose: ¿para quién son los boletos? ---
+            contexto_actual = f"{area_sel}|{fecha_sel}|{cantidad}"
+            if st.session_state.get("desglose_contexto") != contexto_actual:
+                st.session_state.desglose_contexto = contexto_actual
+                st.session_state.desglose_grupos = []
+
+            asignado = sum(g["Boletos"] for g in st.session_state.desglose_grupos)
+            faltan = cantidad - asignado
+
+            st.divider()
+            st.markdown("**¿Para quién son estos boletos?**")
+            st.caption(f"De los {cantidad} boletos, llevas asignados **{asignado}**. Faltan **{faltan}**.")
+
+            if st.session_state.desglose_grupos:
+                st.dataframe(pd.DataFrame(st.session_state.desglose_grupos), hide_index=True, use_container_width=True)
+                if st.button("↩️ Quitar el último grupo agregado"):
+                    st.session_state.desglose_grupos.pop()
+                    st.rerun()
+
+            campos_desglose = get_campos_desglose()
+
+            if faltan > 0:
+                with st.form("form_grupo_desglose", clear_on_submit=True):
+                    valores_campos = {}
+                    for campo in campos_desglose:
+                        valores_campos[campo] = st.text_input(campo)
+                    boletos_grupo = st.number_input(
+                        "Boletos para este grupo", min_value=1, max_value=faltan, value=min(faltan, 1)
                     )
-                    enviado, _ = enviar_correo_confirmacion(
-                        correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad
-                    )
-                    st.success(
-                        f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
-                        "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
-                    )
-                    if enviado:
-                        st.caption(f"📧 Te enviamos un correo de confirmación a {correo_limpio}.")
+                    agregar = st.form_submit_button("Agregar grupo")
+                    if agregar:
+                        if any(not v.strip() for v in valores_campos.values()):
+                            st.error("Completa todos los campos del grupo.")
+                        else:
+                            nuevo_grupo = {campo: valor.strip() for campo, valor in valores_campos.items()}
+                            nuevo_grupo["Boletos"] = int(boletos_grupo)
+                            st.session_state.desglose_grupos.append(nuevo_grupo)
+                            st.rerun()
+            else:
+                st.success("✅ Ya asignaste los boletos completos. Puedes continuar.")
+
+                comentario = st.text_input("Nota (opcional)")
+
+                if st.button("Enviar solicitud", type="primary"):
+                    nombre_limpio = solicitante_nombre.strip()
+                    correo_limpio = solicitante_correo.strip()
+                    if not nombre_limpio:
+                        st.error("Escribe tu nombre completo.")
+                    elif "@" not in correo_limpio or "." not in correo_limpio:
+                        st.error("Escribe un correo electrónico válido.")
                     else:
-                        st.caption("No pudimos enviarte un correo de confirmación, pero tu código sigue siendo válido — guárdalo de todos modos.")
-                    st.session_state.desglose_grupos = []
-                    st.session_state.desglose_contexto = None
+                        codigo = add_reserva(
+                            fecha_sel, area_sel, cantidad, comentario, nombre_limpio, correo_limpio,
+                            st.session_state.desglose_grupos,
+                        )
+                        enviado, _ = enviar_correo_confirmacion(
+                            correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad
+                        )
+                        st.success(
+                            f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
+                            "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
+                        )
+                        if enviado:
+                            st.caption(f"📧 Te enviamos un correo de confirmación a {correo_limpio}.")
+                        else:
+                            st.caption("No pudimos enviarte un correo de confirmación, pero tu código sigue siendo válido — guárdalo de todos modos.")
+                        st.session_state.desglose_grupos = []
+                        st.session_state.desglose_contexto = None
 
 # ----------------------------------------------------------------------------
 # PÁGINA: MI RESERVA
@@ -897,6 +1012,37 @@ elif pagina == "Administración":
             set_rule("max_boletos_por_reserva", max_por_reserva)
             st.success("Reglas actualizadas.")
 
+        st.divider()
+        st.subheader("Días bloqueados")
+        st.caption("Bloquea días completos en los que no se acepten solicitudes, sin importar el cupo disponible.")
+
+        dias_bloqueados = get_dias_bloqueados()
+        if dias_bloqueados:
+            st.dataframe(pd.DataFrame({"Día bloqueado": dias_bloqueados}), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No hay días bloqueados por ahora.")
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            fecha_bloquear = st.date_input("Bloquear este día", value=date.today(), key="fecha_bloquear")
+        with c2:
+            st.write("")
+            if st.button("🚫 Bloquear día"):
+                bloquear_dia(fecha_bloquear)
+                st.success(f"{fecha_bloquear} quedó bloqueado.")
+                st.rerun()
+
+        if dias_bloqueados:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                dia_desbloquear = st.selectbox("Desbloquear un día", dias_bloqueados, key="dia_desbloquear")
+            with c2:
+                st.write("")
+                if st.button("✅ Desbloquear"):
+                    desbloquear_dia(dia_desbloquear)
+                    st.success(f"{dia_desbloquear} quedó desbloqueado.")
+                    st.rerun()
+
     # --- Áreas ---
     with tab_areas:
         st.subheader("Áreas")
@@ -933,6 +1079,27 @@ elif pagina == "Administración":
                     delete_area(area_id)
                     st.success("Área eliminada.")
                     st.rerun()
+
+        st.divider()
+        st.markdown("**Reemplazar todas las áreas de un solo golpe**")
+        st.caption(
+            "Pega la lista completa de áreas, una por línea. Esto borra las áreas actuales y las "
+            "reemplaza por esta lista (las reservas ya hechas conservan su nombre de área tal cual, no se pierden)."
+        )
+        texto_areas = st.text_area(
+            "Una área por línea",
+            value="\n".join(areas_df["nombre"].tolist()),
+            height=200,
+            key="texto_reemplazar_areas",
+        )
+        if st.button("🔁 Reemplazar todas las áreas con esta lista", type="secondary"):
+            nuevas_areas = [linea for linea in texto_areas.split("\n") if linea.strip()]
+            if not nuevas_areas:
+                st.error("La lista no puede estar vacía.")
+            else:
+                reemplazar_areas(nuevas_areas)
+                st.success(f"Listo, ahora hay {len(set(a.strip() for a in nuevas_areas))} área(s) configuradas.")
+                st.rerun()
 
     # --- Plantilla de invitados ---
     with tab_plantilla:
