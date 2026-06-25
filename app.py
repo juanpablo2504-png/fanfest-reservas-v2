@@ -435,9 +435,12 @@ def render_calendario_semaforo(fecha_min, fecha_max):
 # EXCEL DE INVITADOS
 # ----------------------------------------------------------------------------
 
+COLUMNA_CANTIDAD = "N° de boletos"
+
+
 def generar_plantilla_excel(cantidad):
     columnas = get_columnas_invitados()
-    data = {"#": list(range(1, cantidad + 1))}
+    data = {"#": list(range(1, cantidad + 1)), COLUMNA_CANTIDAD: [1 for _ in range(cantidad)]}
     for col in columnas:
         data[col["nombre"]] = ["" for _ in range(cantidad)]
     df = pd.DataFrame(data)
@@ -462,6 +465,12 @@ def validar_lista_invitados(archivo_subido, cantidad_esperada):
     columnas = get_columnas_invitados()
     requeridas = [c["nombre"] for c in columnas if c.get("requerido")]
 
+    if COLUMNA_CANTIDAD not in df.columns:
+        return None, (
+            f"Al archivo le falta la columna '{COLUMNA_CANTIDAD}'. "
+            "Usa la plantilla descargada sin cambiarle los encabezados."
+        )
+
     faltantes = [c for c in requeridas if c not in df.columns]
     if faltantes:
         return None, (
@@ -471,11 +480,26 @@ def validar_lista_invitados(archivo_subido, cantidad_esperada):
 
     df = df.dropna(how="all").reset_index(drop=True)
 
-    if len(df) != cantidad_esperada:
+    cantidades = pd.to_numeric(df[COLUMNA_CANTIDAD], errors="coerce")
+    if cantidades.isna().any():
+        filas = (cantidades[cantidades.isna()].index + 2).tolist()
         return None, (
-            f"Tu reserva es de {cantidad_esperada} boleto(s), pero el archivo tiene "
-            f"{len(df)} fila(s) de invitados. Deben coincidir exactamente."
+            f"La columna '{COLUMNA_CANTIDAD}' tiene un valor inválido o vacío en la(s) fila(s) {filas}. "
+            "Debe ser un número en cada fila."
         )
+    if (cantidades <= 0).any():
+        filas = (cantidades[cantidades <= 0].index + 2).tolist()
+        return None, f"La columna '{COLUMNA_CANTIDAD}' debe ser mayor a 0 en la(s) fila(s) {filas}."
+
+    suma_boletos = int(cantidades.sum())
+    if suma_boletos != cantidad_esperada:
+        return None, (
+            f"Tu reserva es de {cantidad_esperada} boleto(s), pero la suma de la columna "
+            f"'{COLUMNA_CANTIDAD}' da {suma_boletos}. Deben coincidir exactamente "
+            "(si una persona lleva más de un boleto, pon el número en esa misma fila en vez de duplicarla)."
+        )
+
+    df[COLUMNA_CANTIDAD] = cantidades.astype(int)
 
     for columna in requeridas:
         vacios = df[columna].isna() | (df[columna].astype(str).str.strip() == "")
@@ -834,6 +858,11 @@ elif pagina == "Mi reserva":
                     st.markdown("**Siguiente paso: sube la lista de tus invitados**")
 
                 st.write("1️⃣ Descarga la plantilla y llénala (no cambies los encabezados):")
+                st.caption(
+                    f"💡 Si una persona lleva más de un boleto, no dupliques su fila: pon el número "
+                    f"en la columna **'{COLUMNA_CANTIDAD}'** de esa misma fila. La suma de esa columna "
+                    f"debe dar exactamente {int(reserva['cantidad'])}."
+                )
                 plantilla = generar_plantilla_excel(int(reserva["cantidad"]))
                 st.download_button(
                     "⬇️ Descargar plantilla de invitados",
@@ -851,7 +880,7 @@ elif pagina == "Mi reserva":
                     if error:
                         st.error(error)
                     else:
-                        columnas_guardar = [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns]
+                        columnas_guardar = [COLUMNA_CANTIDAD] + [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns]
                         guardar_lista_invitados(int(reserva["id"]), df_validado[columnas_guardar])
                         st.success("¡Lista de invitados recibida! Ya está todo listo. 🎉")
                         st.rerun()
@@ -1166,7 +1195,9 @@ elif pagina == "Administración":
         st.subheader("Columnas de la lista de invitados")
         st.caption(
             "Estas son las columnas que la gente debe llenar al subir su lista de invitados "
-            "después de ser aprobados. La columna '#' siempre se agrega automáticamente para numerar."
+            "después de ser aprobados. La columna '#' numera automáticamente, y la columna "
+            f"'{COLUMNA_CANTIDAD}' es fija: ahí ponen cuántos boletos cubre cada fila (así una persona "
+            "con varios boletos no tiene que duplicar su fila); la suma debe dar el total aprobado."
         )
 
         columnas = get_columnas_invitados()
