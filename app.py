@@ -78,6 +78,8 @@ def init_db():
         ("motivo_rechazo", "TEXT"),
         ("lista_invitados", "TEXT"),
         ("lista_subida_en", "TEXT"),
+        ("solicitante_nombre", "TEXT"),
+        ("solicitante_correo", "TEXT"),
     ]:
         _add_column_if_missing(conn, "reservas", columna, tipo)
 
@@ -200,14 +202,17 @@ def get_reserva_by_codigo(codigo):
     return df.iloc[0].to_dict()
 
 
-def add_reserva(fecha, area, cantidad, comentario):
+def add_reserva(fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo):
     conn = get_conn()
     codigo = generar_codigo_unico(conn)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO reservas (fecha, area, cantidad, comentario, creado_en, estado, codigo) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (str(fecha), area, cantidad, comentario, datetime.now().isoformat(), "pendiente", codigo),
+        "INSERT INTO reservas (fecha, area, cantidad, comentario, creado_en, estado, codigo, "
+        "solicitante_nombre, solicitante_correo) VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            str(fecha), area, cantidad, comentario, datetime.now().isoformat(), "pendiente", codigo,
+            solicitante_nombre, solicitante_correo,
+        ),
     )
     conn.commit()
     conn.close()
@@ -228,6 +233,20 @@ def reservado_aprobado_en(fecha):
     c.execute(
         "SELECT COALESCE(SUM(cantidad),0) FROM reservas WHERE fecha=? AND estado='aprobada'",
         (str(fecha),),
+    )
+    total = c.fetchone()[0]
+    conn.close()
+    return total
+
+
+def reservado_area_dia(fecha, area):
+    """Suma lo que un área ya tiene en juego para un día (pendiente + aprobada, sin contar rechazadas)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(SUM(cantidad),0) FROM reservas "
+        "WHERE fecha=? AND area=? AND estado IN ('pendiente','aprobada')",
+        (str(fecha), area),
     )
     total = c.fetchone()[0]
     conn.close()
@@ -359,6 +378,33 @@ def verificar_admin():
         st.stop()
 
 
+# ----------------------------------------------------------------------------
+# RESPALDO Y EXPORTES
+# ----------------------------------------------------------------------------
+
+def leer_respaldo_db():
+    with open(DB_PATH, "rb") as f:
+        return f.read()
+
+
+def obtener_invitados_consolidados(fecha_ini, fecha_fin):
+    """Junta los invitados de todas las reservas aprobadas (todas las áreas) en un rango de fechas."""
+    df_aprobadas = get_reservas(fecha_ini, fecha_fin, estado="aprobada")
+    filas = []
+    faltantes = 0
+    for _, row in df_aprobadas.iterrows():
+        lista_raw = row.get("lista_invitados")
+        if isinstance(lista_raw, str) and lista_raw.strip():
+            invitados = json.loads(lista_raw)
+            for invitado in invitados:
+                fila = {"Fecha": row["fecha"], "Área": row["area"], "Código de reserva": row["codigo"]}
+                fila.update(invitado)
+                filas.append(fila)
+        else:
+            faltantes += 1
+    return pd.DataFrame(filas), faltantes
+
+
 init_db()
 
 # ----------------------------------------------------------------------------
@@ -392,7 +438,7 @@ if pagina == "Solicitar reserva":
     st.caption(
         f"📌 Cupo de {capacidad_total} boletos por día · puedes solicitar entre "
         f"{fecha_min.strftime('%d/%b')} y {fecha_max.strftime('%d/%b')} · "
-        f"máximo {max_por_reserva} boletos por solicitud."
+        f"máximo {max_por_reserva} boletos por área, por día (entre todas tus solicitudes)."
     )
     st.info(
         "Tu solicitud queda **pendiente de aprobación**. Te daremos un código de reserva: "
@@ -400,6 +446,14 @@ if pagina == "Solicitar reserva":
         "subir ahí la lista de tus invitados."
     )
 
+    st.markdown("**Tus datos**")
+    col_nombre, col_correo = st.columns(2)
+    with col_nombre:
+        solicitante_nombre = st.text_input("Tu nombre completo")
+    with col_correo:
+        solicitante_correo = st.text_input("Tu correo electrónico")
+
+    st.markdown("**Tu solicitud**")
     col1, col2 = st.columns(2)
     with col1:
         area_sel = st.selectbox("Área", areas_df["nombre"].tolist())
@@ -414,21 +468,46 @@ if pagina == "Solicitar reserva":
         "(las solicitudes pendientes de otras personas todavía no se han restado)."
     )
 
-    cantidad = st.number_input("Cantidad de boletos", min_value=1, max_value=max_por_reserva, value=1, step=1)
-    if cantidad > disponible_dia:
-        st.warning(
-            f"Ojo: estás pidiendo más boletos ({cantidad}) que los disponibles según lo ya aprobado "
-            f"({disponible_dia}). Puedes enviar tu solicitud, pero podría rechazarse por falta de cupo."
-        )
+    ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
+    restante_area_dia = max(0, max_por_reserva - ya_area_dia)
 
-    comentario = st.text_input("Nota / responsable (opcional)")
+    st.info(
+        f"El área **{area_sel}** ya tiene **{ya_area_dia}** de **{max_por_reserva}** boletos "
+        f"solicitados/aprobados para el {fecha_sel.strftime('%d/%m/%Y')} "
+        "(sumando solicitudes pendientes y aprobadas)."
+    )
 
-    if st.button("Enviar solicitud", type="primary"):
-        codigo = add_reserva(fecha_sel, area_sel, cantidad, comentario)
-        st.success(
-            f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
-            "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
+    if restante_area_dia == 0:
+        st.error(
+            f"El área **{area_sel}** ya alcanzó el máximo de boletos permitido para este día. "
+            "No se pueden enviar más solicitudes para esta combinación de área y fecha."
         )
+    else:
+        if restante_area_dia < max_por_reserva:
+            st.caption(f"Como ya tiene {ya_area_dia} en juego, esta solicitud puede ser de hasta {restante_area_dia} boletos.")
+
+        cantidad = st.number_input("Cantidad de boletos", min_value=1, max_value=restante_area_dia, value=1, step=1)
+        if cantidad > disponible_dia:
+            st.warning(
+                f"Ojo: estás pidiendo más boletos ({cantidad}) que los disponibles según lo ya aprobado "
+                f"({disponible_dia}). Puedes enviar tu solicitud, pero podría rechazarse por falta de cupo."
+            )
+
+        comentario = st.text_input("Nota / responsable (opcional)")
+
+        if st.button("Enviar solicitud", type="primary"):
+            nombre_limpio = solicitante_nombre.strip()
+            correo_limpio = solicitante_correo.strip()
+            if not nombre_limpio:
+                st.error("Escribe tu nombre completo.")
+            elif "@" not in correo_limpio or "." not in correo_limpio:
+                st.error("Escribe un correo electrónico válido.")
+            else:
+                codigo = add_reserva(fecha_sel, area_sel, cantidad, comentario, nombre_limpio, correo_limpio)
+                st.success(
+                    f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
+                    "en 'Mi reserva' para ver si fue aprobada y subir tu lista de invitados."
+                )
 
 # ----------------------------------------------------------------------------
 # PÁGINA: MI RESERVA
@@ -453,6 +532,7 @@ elif pagina == "Mi reserva":
             c1.metric("Fecha", reserva["fecha"])
             c2.metric("Área", reserva["area"])
             c3.metric("Boletos", reserva["cantidad"])
+            st.caption(f"Solicitado por: {reserva.get('solicitante_nombre') or '—'} · {reserva.get('solicitante_correo') or '—'}")
 
             estado = reserva["estado"]
             if estado == "pendiente":
@@ -580,8 +660,8 @@ elif pagina == "Administración":
     verificar_admin()
     st.title("⚙️ Administración")
 
-    tab_solicitudes, tab_reglas, tab_areas, tab_plantilla, tab_reservas, tab_seguridad = st.tabs(
-        ["Solicitudes pendientes", "Reglas", "Áreas", "Plantilla invitados", "Reservas", "Seguridad"]
+    tab_solicitudes, tab_reglas, tab_areas, tab_plantilla, tab_reservas, tab_respaldo, tab_seguridad = st.tabs(
+        ["Solicitudes pendientes", "Reglas", "Áreas", "Plantilla invitados", "Reservas", "Respaldo y exportar", "Seguridad"]
     )
 
     # --- Solicitudes pendientes ---
@@ -601,6 +681,7 @@ elif pagina == "Administración":
                     c2.write(f"**Fecha:** {row['fecha']}")
                     c3.write(f"**Área:** {row['area']}")
                     c4.write(f"**Cantidad:** {row['cantidad']} · Disponibles ese día: {disponible_dia}")
+                    st.caption(f"Solicitante: {row.get('solicitante_nombre') or '—'} · {row.get('solicitante_correo') or '—'}")
                     if row["comentario"]:
                         st.caption(f"Nota: {row['comentario']}")
 
@@ -636,7 +717,7 @@ elif pagina == "Administración":
             min_value=0, value=int(get_rule("min_dias_anticipacion", 0)),
         )
         max_por_reserva = st.number_input(
-            "Máximo de boletos por solicitud",
+            "Máximo de boletos por área, por día (acumulado entre todas sus solicitudes)",
             min_value=1, value=int(get_rule("max_boletos_por_reserva", 10)),
         )
         if st.button("Guardar reglas", type="primary"):
@@ -770,7 +851,7 @@ elif pagina == "Administración":
             None if area_filtro == "Todas" else area_filtro,
             None if estado_filtro == "Todos" else estado_filtro,
         )
-        columnas_mostrar = ["id", "codigo", "fecha", "area", "cantidad", "estado", "comentario"]
+        columnas_mostrar = ["id", "codigo", "fecha", "area", "cantidad", "estado", "solicitante_nombre", "solicitante_correo", "comentario"]
         st.dataframe(df[columnas_mostrar] if not df.empty else df, hide_index=True, use_container_width=True)
 
         if not df.empty:
@@ -779,6 +860,7 @@ elif pagina == "Administración":
             fila = df[df["id"] == id_sel].iloc[0]
 
             st.write(f"**Código:** {fila['codigo']} · **Estado:** {fila['estado']}")
+            st.caption(f"Solicitante: {fila.get('solicitante_nombre') or '—'} · {fila.get('solicitante_correo') or '—'}")
             if fila["estado"] == "rechazada" and fila.get("motivo_rechazo"):
                 st.caption(f"Motivo de rechazo: {fila['motivo_rechazo']}")
 
@@ -800,6 +882,57 @@ elif pagina == "Administración":
                 delete_reserva(int(id_sel))
                 st.success("Reserva eliminada.")
                 st.rerun()
+
+    # --- Respaldo y exportar ---
+    with tab_respaldo:
+        st.subheader("Respaldo completo de la base de datos")
+        st.caption(
+            "Descarga el archivo completo (reservas, áreas, reglas y listas de invitados). "
+            "Si algo le pasa a la app, puedes restaurar todo reemplazando el archivo reservas.db con este."
+        )
+        try:
+            datos_respaldo = leer_respaldo_db()
+            st.download_button(
+                "⬇️ Descargar respaldo completo (.db)",
+                datos_respaldo,
+                file_name=f"respaldo_reservas_{date.today().isoformat()}.db",
+                mime="application/octet-stream",
+            )
+        except FileNotFoundError:
+            st.warning("Todavía no se ha creado la base de datos (no hay nada que respaldar).")
+
+        st.divider()
+
+        st.subheader("Excel consolidado de invitados (todas las áreas)")
+        st.caption("Junta en un solo Excel a todos los invitados de las reservas aprobadas dentro del rango de fechas que elijas.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            f_export_ini = st.date_input("Desde", value=date.today(), key="export_f_ini")
+        with c2:
+            f_export_fin = st.date_input("Hasta", value=date.today() + timedelta(days=7), key="export_f_fin")
+
+        if f_export_ini > f_export_fin:
+            st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
+        else:
+            df_invitados_consolidado, faltantes = obtener_invitados_consolidados(f_export_ini, f_export_fin)
+
+            if faltantes:
+                st.warning(
+                    f"{faltantes} reserva(s) aprobada(s) en este rango todavía no han subido su lista de invitados "
+                    "— no están incluidas en este Excel."
+                )
+
+            if df_invitados_consolidado.empty:
+                st.info("No hay invitados registrados todavía en este rango de fechas.")
+            else:
+                st.dataframe(df_invitados_consolidado, hide_index=True, use_container_width=True)
+                st.download_button(
+                    "⬇️ Descargar Excel de invitados (todas las áreas)",
+                    df_a_excel_bytes(df_invitados_consolidado),
+                    file_name=f"invitados_{f_export_ini}_{f_export_fin}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
     # --- Seguridad ---
     with tab_seguridad:
