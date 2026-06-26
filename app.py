@@ -9,6 +9,14 @@ import io
 import smtplib
 from email.mime.text import MIMEText
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+ZONA_CDMX = ZoneInfo("America/Mexico_City")
+
+
+def hoy_cdmx():
+    """'Hoy' según la hora de Ciudad de México, sin importar en qué zona horaria corra el servidor."""
+    return datetime.now(ZONA_CDMX).date()
 
 DB_PATH = "reservas.db"
 
@@ -329,6 +337,63 @@ def reservado_aprobado_en(fecha):
     return total
 
 
+def editar_cantidad_reserva(reserva_id, nueva_cantidad):
+    """Cambia la cantidad de boletos de una reserva ya existente, validando que siga
+    respetando el cupo del día y el máximo por área/día (sin contar lo que esta misma
+    reserva ya tenía). Si la reserva ya tenía una lista de invitados subida, se borra
+    porque deja de coincidir con la nueva cantidad."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT fecha, area, cantidad, estado, lista_invitados FROM reservas WHERE id=?", (reserva_id,))
+    row = c.fetchone()
+    if row is None:
+        conn.close()
+        return False, "No se encontró la reserva."
+
+    fecha, area, cantidad_actual, estado, lista_invitados = row
+
+    if nueva_cantidad == cantidad_actual:
+        conn.close()
+        return True, "No hubo cambios (la cantidad ya era esa)."
+
+    if estado == "aprobada":
+        capacidad_total = int(get_rule("capacidad_diaria_total", 70))
+        aprobado_otros = reservado_aprobado_en(fecha) - cantidad_actual
+        disponible_otros = capacidad_total - aprobado_otros
+        if nueva_cantidad > disponible_otros:
+            conn.close()
+            return False, (
+                f"No hay cupo: el día {fecha} solo tiene {disponible_otros} boletos disponibles "
+                "(sin contar esta misma reserva)."
+            )
+
+    if estado in ("aprobada", "pendiente"):
+        max_por_reserva = int(get_rule("max_boletos_por_reserva", 10))
+        usado_area_otros = reservado_area_dia(fecha, area) - cantidad_actual
+        disponible_area_otros = max_por_reserva - usado_area_otros
+        if nueva_cantidad > disponible_area_otros:
+            conn.close()
+            return False, (
+                f"No hay cupo: el área {area} solo tiene {disponible_area_otros} boletos disponibles "
+                f"para el {fecha} (sin contar esta misma reserva)."
+            )
+
+    c.execute("UPDATE reservas SET cantidad=? WHERE id=?", (nueva_cantidad, reserva_id))
+
+    se_borro_lista = False
+    if isinstance(lista_invitados, str) and lista_invitados.strip():
+        c.execute("UPDATE reservas SET lista_invitados=NULL, lista_subida_en=NULL WHERE id=?", (reserva_id,))
+        se_borro_lista = True
+
+    conn.commit()
+    conn.close()
+
+    msg = f"Cantidad actualizada de {cantidad_actual} a {nueva_cantidad} boletos."
+    if se_borro_lista:
+        msg += " La lista de invitados que ya tenía se borró porque ya no coincide — deben subir una actualizada."
+    return True, msg
+
+
 def reservado_area_dia(fecha, area):
     """Suma lo que un área ya tiene en juego para un día (pendiente + aprobada, sin contar rechazadas)."""
     conn = get_conn()
@@ -458,9 +523,10 @@ COLUMNA_CANTIDAD = "N° de boletos"
 
 def generar_plantilla_excel(cantidad):
     columnas = get_columnas_invitados()
-    data = {"#": list(range(1, cantidad + 1)), COLUMNA_CANTIDAD: [1 for _ in range(cantidad)]}
+    data = {"#": list(range(1, cantidad + 1))}
     for col in columnas:
         data[col["nombre"]] = ["" for _ in range(cantidad)]
+    data[COLUMNA_CANTIDAD] = [1 for _ in range(cantidad)]
     df = pd.DataFrame(data)
     return df_a_excel_bytes(df)
 
@@ -544,7 +610,6 @@ def verificar_admin():
                 st.rerun()
             else:
                 st.error("Contraseña incorrecta.")
-        st.caption("Contraseña por defecto: admin123 (cámbiala en Administración → Seguridad).")
         st.stop()
 
 
@@ -660,6 +725,25 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
     return _enviar_correo(destinatario, asunto, cuerpo)
 
 
+def enviar_correo_cantidad_modificada(destinatario, nombre, codigo, fecha, area, cantidad_nueva, se_borro_lista):
+    """Avisa al solicitante que el administrador cambió la cantidad de boletos de su reserva."""
+    cuerpo = (
+        f"Hola {nombre},\n\n"
+        f"Tu reserva con código {codigo} fue actualizada por el equipo organizador.\n\n"
+        f"Fecha: {fecha}\n"
+        f"Área: {area}\n"
+        f"Nueva cantidad de boletos: {cantidad_nueva}\n\n"
+    )
+    if se_borro_lista:
+        cuerpo += (
+            "Como la cantidad cambió, tu lista de invitados anterior ya no es válida. "
+            "Entra a 'Mi reserva' con tu código y sube una lista actualizada que sume exactamente "
+            f"{cantidad_nueva} boletos.\n\n"
+        )
+    cuerpo += f"{PIE_CONTACTO}\n\nEste es un correo automático, por favor no respondas a este mensaje."
+    return _enviar_correo(destinatario, f"Tu reserva fue actualizada - código {codigo}", cuerpo)
+
+
 def enviar_correo_notificacion_admin(codigo, nombre_solicitante, correo_solicitante, fecha, area, cantidad):
     """Avisa a los correos configurados en Administración que llegó una nueva solicitud para revisar."""
     destinatarios = get_correos_notificacion()
@@ -723,7 +807,7 @@ if pagina == "Solicitar reserva":
     min_dias = int(get_rule("min_dias_anticipacion", 0))
     max_por_reserva = int(get_rule("max_boletos_por_reserva", 10))
 
-    hoy = date.today()
+    hoy = hoy_cdmx()
     fecha_min = hoy + timedelta(days=min_dias)
     fecha_max = hoy + timedelta(days=max_dias)
 
@@ -938,7 +1022,7 @@ elif pagina == "Mi reserva":
                     if error:
                         st.error(error)
                     else:
-                        columnas_guardar = [COLUMNA_CANTIDAD] + [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns]
+                        columnas_guardar = [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns] + [COLUMNA_CANTIDAD]
                         guardar_lista_invitados(int(reserva["id"]), df_validado[columnas_guardar])
                         st.success("¡Lista de invitados recibida! Ya está todo listo. 🎉")
                         st.rerun()
@@ -951,7 +1035,7 @@ elif pagina == "Dashboard 🔒":
     verificar_admin()
     st.title("📊 Dashboard de reservas")
 
-    hoy = date.today()
+    hoy = hoy_cdmx()
     col1, col2 = st.columns(2)
     with col1:
         fecha_ini = st.date_input("Desde", value=hoy)
@@ -1124,7 +1208,7 @@ elif pagina == "Administración":
 
         c1, c2 = st.columns([2, 1])
         with c1:
-            fecha_bloquear = st.date_input("Bloquear este día", value=date.today(), key="fecha_bloquear")
+            fecha_bloquear = st.date_input("Bloquear este día", value=hoy_cdmx(), key="fecha_bloquear")
         with c2:
             st.write("")
             if st.button("🚫 Bloquear día"):
@@ -1347,9 +1431,9 @@ elif pagina == "Administración":
         areas_df = get_areas()
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            f_ini = st.date_input("Desde", value=date.today(), key="admin_f_ini")
+            f_ini = st.date_input("Desde", value=hoy_cdmx(), key="admin_f_ini")
         with c2:
-            f_fin = st.date_input("Hasta", value=date.today() + timedelta(days=30), key="admin_f_fin")
+            f_fin = st.date_input("Hasta", value=hoy_cdmx() + timedelta(days=30), key="admin_f_fin")
         with c3:
             area_filtro = st.selectbox("Área (opcional)", ["Todas"] + areas_df["nombre"].tolist())
         with c4:
@@ -1397,6 +1481,32 @@ elif pagina == "Administración":
             else:
                 st.caption("Esta reserva todavía no tiene lista de invitados subida.")
 
+            st.markdown("**Modificar cantidad de boletos**")
+            st.caption(
+                "Útil cuando alguien cancela a última hora o se agregan boletos extra: el cupo del día "
+                "y del área se recalculan solos a partir de este número."
+            )
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                nueva_cantidad = st.number_input(
+                    "Nueva cantidad", min_value=1, value=int(fila["cantidad"]), step=1, key=f"editar_cant_{id_sel}"
+                )
+            with c2:
+                st.write("")
+                if st.button("💾 Actualizar cantidad"):
+                    ok, msg = editar_cantidad_reserva(int(id_sel), int(nueva_cantidad))
+                    if ok:
+                        st.success(msg)
+                        if fila["estado"] != "rechazada" and fila.get("solicitante_correo") and "actualizada" in msg:
+                            enviar_correo_cantidad_modificada(
+                                fila["solicitante_correo"], fila.get("solicitante_nombre") or "",
+                                fila["codigo"], fila["fecha"], fila["area"], int(nueva_cantidad),
+                                se_borro_lista="lista de invitados que ya tenía se borró" in msg,
+                            )
+                    else:
+                        st.error(msg)
+                    st.rerun()
+
             if st.button("🗑️ Cancelar / eliminar esta reserva", type="secondary"):
                 delete_reserva(int(id_sel))
                 st.success("Reserva eliminada.")
@@ -1414,7 +1524,7 @@ elif pagina == "Administración":
             st.download_button(
                 "⬇️ Descargar respaldo completo (.db)",
                 datos_respaldo,
-                file_name=f"respaldo_reservas_{date.today().isoformat()}.db",
+                file_name=f"respaldo_reservas_{hoy_cdmx().isoformat()}.db",
                 mime="application/octet-stream",
             )
         except FileNotFoundError:
@@ -1427,9 +1537,9 @@ elif pagina == "Administración":
 
         c1, c2 = st.columns(2)
         with c1:
-            f_export_ini = st.date_input("Desde", value=date.today(), key="export_f_ini")
+            f_export_ini = st.date_input("Desde", value=hoy_cdmx(), key="export_f_ini")
         with c2:
-            f_export_fin = st.date_input("Hasta", value=date.today() + timedelta(days=7), key="export_f_fin")
+            f_export_fin = st.date_input("Hasta", value=hoy_cdmx() + timedelta(days=7), key="export_f_fin")
 
         if f_export_ini > f_export_fin:
             st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
