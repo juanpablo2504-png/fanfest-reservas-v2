@@ -28,6 +28,9 @@ AREAS_DEFAULT = [
     "Reasinter", "Alianzas", "Técnico", "Siniestros", "Servicios Generales", "Otro",
 ]
 
+# Correos a los que se notifica cada nueva solicitud (editable desde Administración)
+CORREOS_NOTIFICACION_DEFAULT = ["aega@inter.mx", "jpma@inter.mx", "alrf@inter.mx"]
+
 # Campos por defecto del desglose inicial, antes de aprobar (editable desde Administración)
 CAMPOS_DESGLOSE_DEFAULT = ["Empresa"]
 
@@ -124,6 +127,7 @@ def init_db():
         "columnas_invitados": json.dumps(COLUMNAS_DEFAULT, ensure_ascii=False),
         "campos_desglose": json.dumps(CAMPOS_DESGLOSE_DEFAULT, ensure_ascii=False),
         "dias_bloqueados": "[]",
+        "correos_notificacion": json.dumps(CORREOS_NOTIFICACION_DEFAULT, ensure_ascii=False),
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO reglas (clave, valor) VALUES (?,?)", (k, v))
@@ -201,6 +205,20 @@ def bloquear_dia(fecha):
 def desbloquear_dia(fecha):
     dias = [d for d in get_dias_bloqueados() if d != str(fecha)]
     set_rule("dias_bloqueados", json.dumps(dias, ensure_ascii=False))
+
+
+def get_correos_notificacion():
+    raw = get_rule("correos_notificacion")
+    if not raw:
+        return list(CORREOS_NOTIFICACION_DEFAULT)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return list(CORREOS_NOTIFICACION_DEFAULT)
+
+
+def set_correos_notificacion(correos):
+    set_rule("correos_notificacion", json.dumps(correos, ensure_ascii=False))
 
 
 def get_areas():
@@ -642,6 +660,43 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
     return _enviar_correo(destinatario, asunto, cuerpo)
 
 
+def enviar_correo_notificacion_admin(codigo, nombre_solicitante, correo_solicitante, fecha, area, cantidad):
+    """Avisa a los correos configurados en Administración que llegó una nueva solicitud para revisar."""
+    destinatarios = get_correos_notificacion()
+    if not destinatarios:
+        return False, "No hay correos de notificación configurados."
+
+    cuerpo = (
+        "Llegó una nueva solicitud de boletos para el Fan Fest, pendiente de revisión.\n\n"
+        f"Código: {codigo}\n"
+        f"Solicitante: {nombre_solicitante} ({correo_solicitante})\n"
+        f"Fecha: {fecha}\n"
+        f"Área: {area}\n"
+        f"Cantidad de boletos: {cantidad}\n\n"
+        "Entra a Administración → Solicitudes pendientes para aprobarla o rechazarla.\n\n"
+        "Este es un correo automático, por favor no respondas a este mensaje."
+    )
+
+    try:
+        remitente = st.secrets["email"]["remitente"]
+        password = st.secrets["email"]["password"]
+    except Exception:
+        return False, "El envío de correo no está configurado todavía (faltan credenciales en Secrets)."
+
+    mensaje = MIMEText(cuerpo, "plain", "utf-8")
+    mensaje["Subject"] = f"Nueva solicitud pendiente - código {codigo}"
+    mensaje["From"] = remitente
+    mensaje["To"] = ", ".join(destinatarios)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+            servidor.login(remitente, password)
+            servidor.sendmail(remitente, destinatarios, mensaje.as_string())
+        return True, "Correo enviado."
+    except Exception as e:
+        return False, f"No se pudo enviar el correo: {e}"
+
+
 init_db()
 
 # ----------------------------------------------------------------------------
@@ -798,6 +853,9 @@ if pagina == "Solicitar reserva":
                         )
                         enviado, _ = enviar_correo_confirmacion(
                             correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad
+                        )
+                        enviar_correo_notificacion_admin(
+                            codigo, nombre_limpio, correo_limpio, fecha_sel, area_sel, cantidad
                         )
                         st.success(
                             f"¡Solicitud enviada! Tu código de reserva es **{codigo}**. Guárdalo: lo vas a necesitar "
@@ -1084,6 +1142,29 @@ elif pagina == "Administración":
                     desbloquear_dia(dia_desbloquear)
                     st.success(f"{dia_desbloquear} quedó desbloqueado.")
                     st.rerun()
+
+        st.divider()
+        st.subheader("Correos de notificación de nuevas solicitudes")
+        st.caption(
+            "Cada vez que alguien manda una solicitud, se avisa por correo a esta lista para que entren a revisarla. "
+            "Un correo por línea."
+        )
+        correos_actuales = get_correos_notificacion()
+        texto_correos = st.text_area(
+            "Correos a notificar",
+            value="\n".join(correos_actuales),
+            height=120,
+            key="texto_correos_notificacion",
+        )
+        if st.button("Guardar correos de notificación"):
+            nuevos_correos = [c.strip() for c in texto_correos.split("\n") if c.strip()]
+            invalidos = [c for c in nuevos_correos if "@" not in c or "." not in c]
+            if invalidos:
+                st.error(f"Estos correos no se ven válidos: {', '.join(invalidos)}")
+            else:
+                set_correos_notificacion(nuevos_correos)
+                st.success("Lista de correos de notificación actualizada.")
+                st.rerun()
 
     # --- Áreas ---
     with tab_areas:
