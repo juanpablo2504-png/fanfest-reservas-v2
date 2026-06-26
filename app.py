@@ -10,6 +10,8 @@ import smtplib
 from email.mime.text import MIMEText
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils import get_column_letter
 
 ZONA_CDMX = ZoneInfo("America/Mexico_City")
 
@@ -518,17 +520,48 @@ def render_calendario_semaforo(fecha_min, fecha_max):
 # EXCEL DE INVITADOS
 # ----------------------------------------------------------------------------
 
+COLUMNA_AREA = "Área responsable"
 COLUMNA_CANTIDAD = "N° de boletos"
 
 
-def generar_plantilla_excel(cantidad):
+def generar_plantilla_excel(cantidad, area):
     columnas = get_columnas_invitados()
-    data = {"#": list(range(1, cantidad + 1))}
+    data = {"#": list(range(1, cantidad + 1)), COLUMNA_AREA: [area for _ in range(cantidad)]}
     for col in columnas:
         data[col["nombre"]] = ["" for _ in range(cantidad)]
     data[COLUMNA_CANTIDAD] = [1 for _ in range(cantidad)]
     df = pd.DataFrame(data)
-    return df_a_excel_bytes(df)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Invitados")
+        libro = writer.book
+        hoja = writer.sheets["Invitados"]
+
+        columnas_combo = [col for col in columnas if col.get("opciones")]
+        if columnas_combo:
+            hoja_opciones = libro.create_sheet("_opciones")
+            hoja_opciones.sheet_state = "hidden"
+            nombres_columnas_df = list(df.columns)
+
+            for idx_combo, col in enumerate(columnas_combo):
+                opciones = col["opciones"]
+                col_letra_opciones = get_column_letter(idx_combo + 1)
+                for fila_idx, opcion in enumerate(opciones, start=1):
+                    hoja_opciones.cell(row=fila_idx, column=idx_combo + 1, value=opcion)
+
+                rango_opciones = f"'_opciones'!${col_letra_opciones}$1:${col_letra_opciones}${len(opciones)}"
+                dv = DataValidation(type="list", formula1=rango_opciones, allow_blank=True)
+                dv.error = "Selecciona un valor de la lista."
+                dv.errorTitle = "Valor no válido"
+
+                col_idx_destino = nombres_columnas_df.index(col["nombre"]) + 1
+                col_letra_destino = get_column_letter(col_idx_destino)
+                dv.add(f"{col_letra_destino}2:{col_letra_destino}{cantidad + 1}")
+                hoja.add_data_validation(dv)
+
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def df_a_excel_bytes(df):
@@ -590,6 +623,24 @@ def validar_lista_invitados(archivo_subido, cantidad_esperada):
         if vacios.any():
             filas = (vacios[vacios].index + 2).tolist()  # +2: encabezado + base 1
             return None, f"Falta '{columna}' en la(s) fila(s) {filas} del Excel. Complétalo y vuelve a subirlo."
+
+    for col in columnas:
+        opciones = col.get("opciones") or []
+        nombre_col = col["nombre"]
+        if not opciones or nombre_col not in df.columns:
+            continue
+        valores = df[nombre_col].astype(str).str.strip()
+        opciones_set = set(opciones)
+        if col.get("requerido"):
+            invalidos = ~valores.isin(opciones_set)
+        else:
+            invalidos = (~valores.isin(opciones_set)) & (valores != "") & (valores.str.lower() != "nan")
+        if invalidos.any():
+            filas = (invalidos[invalidos].index + 2).tolist()
+            return None, (
+                f"La columna '{nombre_col}' solo acepta uno de estos valores: {', '.join(opciones)}. "
+                f"Revisa la(s) fila(s) {filas} (usa el menú desplegable de la celda)."
+            )
 
     return df, None
 
@@ -1005,7 +1056,7 @@ elif pagina == "Mi reserva":
                     f"en la columna **'{COLUMNA_CANTIDAD}'** de esa misma fila. La suma de esa columna "
                     f"debe dar exactamente {int(reserva['cantidad'])}."
                 )
-                plantilla = generar_plantilla_excel(int(reserva["cantidad"]))
+                plantilla = generar_plantilla_excel(int(reserva["cantidad"]), reserva["area"])
                 st.download_button(
                     "⬇️ Descargar plantilla de invitados",
                     plantilla,
@@ -1022,7 +1073,8 @@ elif pagina == "Mi reserva":
                     if error:
                         st.error(error)
                     else:
-                        columnas_guardar = [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns] + [COLUMNA_CANTIDAD]
+                        columna_area_presente = [COLUMNA_AREA] if COLUMNA_AREA in df_validado.columns else []
+                        columnas_guardar = columna_area_presente + [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns] + [COLUMNA_CANTIDAD]
                         guardar_lista_invitados(int(reserva["id"]), df_validado[columnas_guardar])
                         st.success("¡Lista de invitados recibida! Ya está todo listo. 🎉")
                         st.rerun()
@@ -1360,37 +1412,53 @@ elif pagina == "Administración":
         st.subheader("Columnas de la lista de invitados")
         st.caption(
             "Estas son las columnas que la gente debe llenar al subir su lista de invitados "
-            "después de ser aprobados. La columna '#' numera automáticamente, y la columna "
+            "después de ser aprobados. La columna '#' numera automáticamente, "
+            f"'{COLUMNA_AREA}' se llena sola con el área de la reserva, y "
             f"'{COLUMNA_CANTIDAD}' es fija: ahí ponen cuántos boletos cubre cada fila (así una persona "
             "con varios boletos no tiene que duplicar su fila); la suma debe dar el total aprobado."
         )
 
         columnas = get_columnas_invitados()
         if columnas:
-            tabla = pd.DataFrame(columnas).rename(columns={"nombre": "Columna", "requerido": "Obligatoria"})
+            tabla = pd.DataFrame([
+                {
+                    "Columna": c["nombre"],
+                    "Obligatoria": c.get("requerido", False),
+                    "Tipo": "Combo" if c.get("opciones") else "Texto libre",
+                    "Opciones": ", ".join(c.get("opciones") or []) if c.get("opciones") else "—",
+                }
+                for c in columnas
+            ])
             st.dataframe(tabla, hide_index=True, use_container_width=True)
         else:
             st.warning("No hay columnas configuradas todavía.")
 
         st.markdown("**Agregar columna**")
-        c1, c2, c3 = st.columns([3, 1, 1])
+        c1, c2 = st.columns([3, 1])
         with c1:
             nueva_col_nombre = st.text_input("Nombre de la columna", key="nueva_col_nombre")
         with c2:
             nueva_col_requerida = st.checkbox("Obligatoria", value=False, key="nueva_col_requerida")
-        with c3:
-            st.write("")
-            if st.button("Agregar columna"):
-                nombre_limpio = nueva_col_nombre.strip()
-                if not nombre_limpio:
-                    st.error("Escribe un nombre para la columna.")
-                elif nombre_limpio in [c["nombre"] for c in columnas]:
-                    st.error("Ya existe una columna con ese nombre.")
-                else:
-                    columnas.append({"nombre": nombre_limpio, "requerido": nueva_col_requerida})
-                    set_columnas_invitados(columnas)
-                    st.success("Columna agregada.")
-                    st.rerun()
+        nuevas_opciones_texto = st.text_area(
+            "Opciones para combo (una por línea, opcional — déjalo vacío para texto libre)",
+            key="nuevas_opciones_combo",
+            height=80,
+        )
+        if st.button("Agregar columna"):
+            nombre_limpio = nueva_col_nombre.strip()
+            opciones_nuevas = [o.strip() for o in nuevas_opciones_texto.split("\n") if o.strip()]
+            if not nombre_limpio:
+                st.error("Escribe un nombre para la columna.")
+            elif nombre_limpio in [c["nombre"] for c in columnas]:
+                st.error("Ya existe una columna con ese nombre.")
+            else:
+                nueva_col = {"nombre": nombre_limpio, "requerido": nueva_col_requerida}
+                if opciones_nuevas:
+                    nueva_col["opciones"] = opciones_nuevas
+                columnas.append(nueva_col)
+                set_columnas_invitados(columnas)
+                st.success("Columna agregada.")
+                st.rerun()
 
         if columnas:
             st.markdown("**Marcar / desmarcar como obligatoria**")
@@ -1409,6 +1477,27 @@ elif pagina == "Administración":
                     set_columnas_invitados(columnas)
                     st.success("Columna actualizada.")
                     st.rerun()
+
+            st.markdown("**Convertir una columna en combo (lista desplegable) o quitarle el combo**")
+            col_combo_sel = st.selectbox("Columna", [c["nombre"] for c in columnas], key="col_combo_sel")
+            opciones_actuales = next((c.get("opciones") or [] for c in columnas if c["nombre"] == col_combo_sel), [])
+            texto_opciones = st.text_area(
+                "Opciones (una por línea — deja vacío para que vuelva a ser texto libre)",
+                value="\n".join(opciones_actuales),
+                key="texto_opciones_combo_editar",
+                height=100,
+            )
+            if st.button("Guardar opciones de esta columna"):
+                opciones_editadas = [o.strip() for o in texto_opciones.split("\n") if o.strip()]
+                for c in columnas:
+                    if c["nombre"] == col_combo_sel:
+                        if opciones_editadas:
+                            c["opciones"] = opciones_editadas
+                        else:
+                            c.pop("opciones", None)
+                set_columnas_invitados(columnas)
+                st.success("Opciones actualizadas.")
+                st.rerun()
 
             st.markdown("**Quitar columna**")
             c1, c2 = st.columns([3, 1])
