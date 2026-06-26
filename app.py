@@ -695,7 +695,7 @@ def obtener_invitados_consolidados(fecha_ini, fecha_fin):
 # CORREO DE CONFIRMACIÓN
 # ----------------------------------------------------------------------------
 
-def _enviar_correo(destinatario, asunto, cuerpo):
+def _enviar_correo(destinatario, asunto, cuerpo, es_html=False):
     """Función base de envío. Requiere las credenciales en st.secrets['email'].
     Si no están configuradas, no rompe la app: solo avisa con un mensaje de retorno."""
     try:
@@ -704,7 +704,7 @@ def _enviar_correo(destinatario, asunto, cuerpo):
     except Exception:
         return False, "El envío de correo no está configurado todavía (faltan credenciales en Secrets)."
 
-    mensaje = MIMEText(cuerpo, "plain", "utf-8")
+    mensaje = MIMEText(cuerpo, "html" if es_html else "plain", "utf-8")
     mensaje["Subject"] = asunto
     mensaje["From"] = remitente
     mensaje["To"] = destinatario
@@ -718,21 +718,25 @@ def _enviar_correo(destinatario, asunto, cuerpo):
         return False, f"No se pudo enviar el correo: {e}"
 
 
+APP_URL = "https://fanfest-reservas-v2-mdppu7qiph23uctzurmjsc.streamlit.app/"
+
+
 def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad):
     """Correo enviado justo al recibir la solicitud (queda pendiente)."""
     cuerpo = (
-        f"Hola {nombre},\n\n"
-        "Recibimos tu solicitud de boletos para el Fan Fest.\n\n"
-        f"Código de reserva: {codigo}\n"
-        f"Fecha: {fecha}\n"
-        f"Área: {area}\n"
-        f"Cantidad de boletos: {cantidad}\n\n"
+        f"Hola {nombre},<br><br>"
+        "Recibimos tu solicitud de boletos para el Fan Fest.<br><br>"
+        f"Código de reserva: {codigo}<br>"
+        f"Fecha: {fecha}<br>"
+        f"Área: {area}<br>"
+        f"Cantidad de boletos: {cantidad}<br><br>"
         "Guarda este código: lo vas a necesitar para consultar el estado de tu solicitud "
-        "y, si se aprueba, subir la lista detallada de tus invitados.\n\n"
-        f"{PIE_CONTACTO}\n\n"
+        "y, si se aprueba, subir la lista detallada de tus invitados.<br><br>"
+        f"Sigue tu reserva <a href=\"{APP_URL}\">aquí</a>.<br><br>"
+        f"{PIE_CONTACTO.replace(chr(10), '<br>')}<br><br>"
         "Este es un correo automático, por favor no respondas a este mensaje."
     )
-    return _enviar_correo(destinatario, f"Confirmación de tu solicitud - código {codigo}", cuerpo)
+    return _enviar_correo(destinatario, f"Confirmación de tu solicitud - código {codigo}", cuerpo, es_html=True)
 
 
 PIE_CONTACTO = (
@@ -748,17 +752,19 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
     if estado == "aprobada":
         asunto = f"¡Tu solicitud fue aprobada! - código {codigo}"
         cuerpo = (
-            f"Hola {nombre},\n\n"
-            "¡Buenas noticias! Tu solicitud de boletos para el Fan Fest fue APROBADA.\n\n"
-            f"Código de reserva: {codigo}\n"
-            f"Fecha: {fecha}\n"
-            f"Área: {area}\n"
-            f"Cantidad de boletos: {cantidad}\n\n"
+            f"Hola {nombre},<br><br>"
+            "¡Buenas noticias! Tu solicitud de boletos para el Fan Fest fue APROBADA.<br><br>"
+            f"Código de reserva: {codigo}<br>"
+            f"Fecha: {fecha}<br>"
+            f"Área: {area}<br>"
+            f"Cantidad de boletos: {cantidad}<br><br>"
             "Siguiente paso: entra a la app, ve a 'Mi reserva', pon tu código y sube la lista "
-            "detallada con el nombre completo de cada uno de tus invitados.\n\n"
-            f"{PIE_CONTACTO}\n\n"
+            "detallada con el nombre completo de cada uno de tus invitados.<br><br>"
+            f"Sigue tu reserva <a href=\"{APP_URL}\">aquí</a>.<br><br>"
+            f"{PIE_CONTACTO.replace(chr(10), '<br>')}<br><br>"
             "Este es un correo automático, por favor no respondas a este mensaje."
         )
+        return _enviar_correo(destinatario, asunto, cuerpo, es_html=True)
     else:
         asunto = f"Tu solicitud fue rechazada - código {codigo}"
         motivo_texto = f"\n\nMotivo: {motivo_rechazo}" if motivo_rechazo else ""
@@ -773,7 +779,7 @@ def enviar_correo_resultado(destinatario, nombre, codigo, fecha, area, cantidad,
             f"{PIE_CONTACTO}\n\n"
             "Este es un correo automático, por favor no respondas a este mensaje."
         )
-    return _enviar_correo(destinatario, asunto, cuerpo)
+        return _enviar_correo(destinatario, asunto, cuerpo)
 
 
 def enviar_correo_cantidad_modificada(destinatario, nombre, codigo, fecha, area, cantidad_nueva, se_borro_lista):
@@ -1076,7 +1082,10 @@ elif pagina == "Mi reserva":
                         columna_area_presente = [COLUMNA_AREA] if COLUMNA_AREA in df_validado.columns else []
                         columnas_guardar = columna_area_presente + [c["nombre"] for c in get_columnas_invitados() if c["nombre"] in df_validado.columns] + [COLUMNA_CANTIDAD]
                         guardar_lista_invitados(int(reserva["id"]), df_validado[columnas_guardar])
-                        st.success("¡Lista de invitados recibida! Ya está todo listo. 🎉")
+                        st.success(
+                            "¡Lista de invitados recibida! Ya está todo listo. 🎉 Pronto te estará "
+                            "contactando alguien del equipo comercial para coordinar la entrega de tus boletos."
+                        )
                         st.rerun()
 
 # ----------------------------------------------------------------------------
