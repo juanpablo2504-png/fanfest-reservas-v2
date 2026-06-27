@@ -1416,7 +1416,7 @@ elif pagina == "Administración":
                 nuevo_valor = st.checkbox("Sin límite (uso administrativo)", value=valor_actual, key="area_toggle_valor")
             with c3:
                 st.write("")
-                if st.button("Actualizar"):
+                if st.button("Actualizar", key="btn_actualizar_area_sin_limite"):
                     set_area_sin_limite(area_toggle, nuevo_valor)
                     st.success("Área actualizada.")
                     st.rerun()
@@ -1565,7 +1565,7 @@ elif pagina == "Administración":
                 nueva_req = st.checkbox("Obligatoria", value=req_actual, key="col_editar_req")
             with c3:
                 st.write("")
-                if st.button("Actualizar"):
+                if st.button("Actualizar", key="btn_actualizar_columna_obligatoria"):
                     for c in columnas:
                         if c["nombre"] == col_editar:
                             c["requerido"] = nueva_req
