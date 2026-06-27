@@ -338,7 +338,7 @@ def add_reserva(fecha, area, cantidad, comentario, solicitante_nombre, solicitan
     return codigo
 
 
-def crear_reserva_con_codigo(codigo, fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo, estado):
+def crear_reserva_con_codigo(codigo, fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo, estado, desglose_inicial=None):
     """Crea una reserva directamente sin pasar por las validaciones de cupo del flujo público —
     pensado para administración (ej. áreas sin límite) o para recuperar una reserva perdida
     conservando el mismo código que ya le había llegado por correo a la persona. Si dejas el
@@ -358,7 +358,7 @@ def crear_reserva_con_codigo(codigo, fecha, area, cantidad, comentario, solicita
         "solicitante_nombre, solicitante_correo, desglose_inicial) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             str(fecha), area, cantidad, comentario, datetime.now().isoformat(), estado, codigo_limpio,
-            solicitante_nombre, solicitante_correo, json.dumps([], ensure_ascii=False),
+            solicitante_nombre, solicitante_correo, json.dumps(desglose_inicial or [], ensure_ascii=False),
         ),
     )
     conn.commit()
@@ -768,15 +768,34 @@ def _enviar_correo(destinatario, asunto, cuerpo, es_html=False):
 APP_URL = "https://fanfest-reservas-v2-mdppu7qiph23uctzurmjsc.streamlit.app/"
 
 
-def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad):
+def formatear_desglose_texto_html(desglose):
+    """Convierte la lista de grupos del desglose en líneas legibles para el correo."""
+    if not desglose:
+        return ""
+    lineas = []
+    for grupo in desglose:
+        partes = [f"{clave}: {valor}" for clave, valor in grupo.items() if clave != "Boletos"]
+        partes.append(f"Boletos: {grupo.get('Boletos', '')}")
+        lineas.append(" · ".join(partes))
+    return "<br>".join(lineas)
+
+
+def enviar_correo_confirmacion(destinatario, nombre, codigo, fecha, area, cantidad, desglose=None):
     """Correo enviado justo al recibir la solicitud (queda pendiente)."""
+    desglose_html = ""
+    if desglose:
+        desglose_html = (
+            "<br>Desglose (para quién son los boletos):<br>"
+            f"{formatear_desglose_texto_html(desglose)}<br><br>"
+        )
     cuerpo = (
         f"Hola {nombre},<br><br>"
         "Recibimos tu solicitud de boletos para el Fan Fest.<br><br>"
         f"Código de reserva: {codigo}<br>"
         f"Fecha: {fecha}<br>"
         f"Área: {area}<br>"
-        f"Cantidad de boletos: {cantidad}<br><br>"
+        f"Cantidad de boletos: {cantidad}<br>"
+        f"{desglose_html}"
         "Guarda este código: lo vas a necesitar para consultar el estado de tu solicitud "
         "y, si se aprueba, subir la lista detallada de tus invitados.<br><br>"
         f"Sigue tu reserva <a href=\"{APP_URL}\">aquí</a>.<br><br>"
@@ -1053,7 +1072,8 @@ if pagina == "Solicitar reserva":
                             st.session_state.desglose_grupos,
                         )
                         enviado, _ = enviar_correo_confirmacion(
-                            correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad
+                            correo_limpio, nombre_limpio, codigo, fecha_sel, area_sel, cantidad,
+                            desglose=st.session_state.desglose_grupos,
                         )
                         enviar_correo_notificacion_admin(
                             codigo, nombre_limpio, correo_limpio, fecha_sel, area_sel, cantidad
@@ -1704,6 +1724,44 @@ elif pagina == "Administración":
             "(se genera uno automático), o escribe el código que ya le había llegado por correo a "
             "alguien si estás recuperando una reserva perdida. Aquí no se valida ningún cupo."
         )
+
+        if "admin_recrear_desglose_grupos" not in st.session_state:
+            st.session_state.admin_recrear_desglose_grupos = []
+
+        st.markdown("**Desglose (opcional) — para quién son los boletos**")
+        st.caption(
+            "Si tienes el correo de confirmación original, ahí viene este desglose tal cual lo "
+            "puso la persona. Es opcional: puedes guardar la reserva sin llenarlo."
+        )
+        if st.session_state.admin_recrear_desglose_grupos:
+            st.dataframe(
+                pd.DataFrame(st.session_state.admin_recrear_desglose_grupos), hide_index=True, use_container_width=True
+            )
+            suma_desglose_admin = sum(g["Boletos"] for g in st.session_state.admin_recrear_desglose_grupos)
+            st.caption(f"Suma del desglose hasta ahora: {suma_desglose_admin} boletos.")
+            if st.button("↩️ Quitar el último grupo del desglose", key="btn_quitar_grupo_admin"):
+                st.session_state.admin_recrear_desglose_grupos.pop()
+                st.rerun()
+
+        campos_desglose_admin = get_campos_desglose()
+        with st.form("form_admin_grupo_desglose", clear_on_submit=True):
+            valores_admin_desglose = {}
+            for campo in campos_desglose_admin:
+                valores_admin_desglose[campo] = st.text_input(campo, key=f"admin_desglose_campo_{campo}")
+            boletos_grupo_admin = st.number_input(
+                "Boletos de este grupo", min_value=1, value=1, key="admin_desglose_boletos"
+            )
+            if st.form_submit_button("➕ Agregar grupo al desglose"):
+                if any(not v.strip() for v in valores_admin_desglose.values()):
+                    st.error("Completa todos los campos del grupo antes de agregarlo.")
+                else:
+                    nuevo_grupo_admin = {campo: valor.strip() for campo, valor in valores_admin_desglose.items()}
+                    nuevo_grupo_admin["Boletos"] = int(boletos_grupo_admin)
+                    st.session_state.admin_recrear_desglose_grupos.append(nuevo_grupo_admin)
+                    st.rerun()
+
+        st.divider()
+
         with st.form("form_recrear_reserva", clear_on_submit=True):
             rc1, rc2 = st.columns(2)
             with rc1:
@@ -1724,9 +1782,11 @@ elif pagina == "Administración":
                     ok, msg = crear_reserva_con_codigo(
                         r_codigo, r_fecha, r_area, int(r_cantidad), r_comentario,
                         r_nombre.strip(), r_correo.strip(), r_estado,
+                        desglose_inicial=st.session_state.admin_recrear_desglose_grupos,
                     )
                     if ok:
                         st.success(msg)
+                        st.session_state.admin_recrear_desglose_grupos = []
                     else:
                         st.error(msg)
 
