@@ -112,6 +112,8 @@ def init_db():
     ]:
         _add_column_if_missing(conn, "reservas", columna, tipo)
 
+    _add_column_if_missing(conn, "areas", "sin_limite", "INTEGER DEFAULT 0")
+
     # Reservas creadas antes del flujo de aprobación: se consideran ya aprobadas
     c.execute("UPDATE reservas SET estado='aprobada' WHERE estado IS NULL OR estado=''")
     c.execute("SELECT id FROM reservas WHERE codigo IS NULL OR codigo=''")
@@ -238,10 +240,27 @@ def get_areas():
     return df
 
 
-def add_area(nombre):
+def add_area(nombre, sin_limite=False):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO areas (nombre, capacidad_diaria) VALUES (?, 0)", (nombre,))
+    c.execute("INSERT INTO areas (nombre, capacidad_diaria, sin_limite) VALUES (?, 0, ?)", (nombre, int(sin_limite)))
+    conn.commit()
+    conn.close()
+
+
+def area_es_sin_limite(nombre):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT sin_limite FROM areas WHERE nombre=?", (nombre,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row[0]) if row else False
+
+
+def set_area_sin_limite(nombre, sin_limite):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE areas SET sin_limite=? WHERE nombre=?", (int(sin_limite), nombre))
     conn.commit()
     conn.close()
 
@@ -319,6 +338,34 @@ def add_reserva(fecha, area, cantidad, comentario, solicitante_nombre, solicitan
     return codigo
 
 
+def crear_reserva_con_codigo(codigo, fecha, area, cantidad, comentario, solicitante_nombre, solicitante_correo, estado):
+    """Crea una reserva directamente sin pasar por las validaciones de cupo del flujo público —
+    pensado para administración (ej. áreas sin límite) o para recuperar una reserva perdida
+    conservando el mismo código que ya le había llegado por correo a la persona. Si dejas el
+    código en blanco, se genera uno nuevo automáticamente."""
+    conn = get_conn()
+    c = conn.cursor()
+    codigo_limpio = codigo.strip().upper()
+    if not codigo_limpio:
+        codigo_limpio = generar_codigo_unico(conn)
+    else:
+        c.execute("SELECT 1 FROM reservas WHERE codigo=?", (codigo_limpio,))
+        if c.fetchone() is not None:
+            conn.close()
+            return False, f"Ya existe una reserva con el código {codigo_limpio}."
+    c.execute(
+        "INSERT INTO reservas (fecha, area, cantidad, comentario, creado_en, estado, codigo, "
+        "solicitante_nombre, solicitante_correo, desglose_inicial) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            str(fecha), area, cantidad, comentario, datetime.now().isoformat(), estado, codigo_limpio,
+            solicitante_nombre, solicitante_correo, json.dumps([], ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True, f"Reserva recreada con código {codigo_limpio}."
+
+
 def delete_reserva(reserva_id):
     conn = get_conn()
     c = conn.cursor()
@@ -369,7 +416,7 @@ def editar_cantidad_reserva(reserva_id, nueva_cantidad):
                 "(sin contar esta misma reserva)."
             )
 
-    if estado in ("aprobada", "pendiente"):
+    if estado in ("aprobada", "pendiente") and not area_es_sin_limite(area):
         max_por_reserva = int(get_rule("max_boletos_por_reserva", 10))
         usado_area_otros = reservado_area_dia(fecha, area) - cantidad_actual
         disponible_area_otros = max_por_reserva - usado_area_otros
@@ -855,6 +902,7 @@ if pagina == "Solicitar reserva":
     st.title("🎫 Solicitar boletos")
 
     areas_df = get_areas()
+    areas_df = areas_df[areas_df["sin_limite"] == 0]  # las áreas sin límite son solo de uso administrativo
     if areas_df.empty:
         st.warning("Todavía no hay áreas configuradas. Ve a Administración para crear una.")
         st.stop()
@@ -916,20 +964,32 @@ if pagina == "Solicitar reserva":
             f"**{aprobado_dia}** de {capacidad_total} · quedan **{disponible_dia}** disponibles."
         )
 
-        ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
-        restante_area_dia = max(0, max_por_reserva - ya_area_dia)
+        es_area_sin_limite = area_es_sin_limite(area_sel)
 
-        st.info(
-            f"El área **{area_sel}** ya tiene **{ya_area_dia}** de **{max_por_reserva}** boletos "
-            f"solicitados/aprobados para el {fecha_sel.strftime('%d/%m/%Y')} "
-            "(sumando solicitudes pendientes y aprobadas)."
-        )
+        if es_area_sin_limite:
+            ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
+            restante_area_dia = disponible_dia
+            st.info(
+                f"El área **{area_sel}** es un área sin límite propio: solo está sujeta al cupo "
+                f"total del día ({disponible_dia} disponibles)."
+            )
+        else:
+            ya_area_dia = reservado_area_dia(fecha_sel, area_sel)
+            restante_area_dia = max(0, max_por_reserva - ya_area_dia)
+            st.info(
+                f"El área **{area_sel}** ya tiene **{ya_area_dia}** de **{max_por_reserva}** boletos "
+                f"solicitados/aprobados para el {fecha_sel.strftime('%d/%m/%Y')} "
+                "(sumando solicitudes pendientes y aprobadas)."
+            )
 
         if restante_area_dia == 0:
-            st.error(
-                f"El área **{area_sel}** ya alcanzó el máximo de boletos permitido para este día. "
-                "No se pueden enviar más solicitudes para esta combinación de área y fecha."
-            )
+            if es_area_sin_limite:
+                st.error(f"El **{fecha_sel.strftime('%d/%m/%Y')}** ya no tiene cupo disponible.")
+            else:
+                st.error(
+                    f"El área **{area_sel}** ya alcanzó el máximo de boletos permitido para este día. "
+                    "No se pueden enviar más solicitudes para esta combinación de área y fecha."
+                )
         else:
             tope_cantidad = min(restante_area_dia, disponible_dia)
             if tope_cantidad < max_por_reserva:
@@ -1314,26 +1374,52 @@ elif pagina == "Administración":
     # --- Áreas ---
     with tab_areas:
         st.subheader("Áreas")
-        st.caption("Las áreas ya no tienen capacidad propia: solo sirven para clasificar las reservas. El cupo es el total diario definido en Reglas.")
+        st.caption(
+            "Las áreas ya no tienen capacidad propia: solo sirven para clasificar las reservas. "
+            "El cupo es el total diario definido en Reglas. Las áreas marcadas como 'sin límite' "
+            "no están sujetas al máximo por área/día — solo al cupo total del día (útil para uso "
+            "administrativo, ej. una reserva del equipo organizador)."
+        )
         areas_df = get_areas()
-        st.dataframe(areas_df[["nombre"]], hide_index=True, use_container_width=True)
+        tabla_areas = areas_df[["nombre", "sin_limite"]].rename(
+            columns={"nombre": "Área", "sin_limite": "Sin límite"}
+        )
+        tabla_areas["Sin límite"] = tabla_areas["Sin límite"].astype(bool)
+        st.dataframe(tabla_areas, hide_index=True, use_container_width=True)
 
         st.markdown("**Agregar nueva área**")
-        c1, c2 = st.columns([3, 1])
+        c1, c2, c3 = st.columns([3, 2, 1])
         with c1:
             nueva_area_nombre = st.text_input("Nombre del área", key="new_area_name")
         with c2:
+            nueva_area_sin_limite = st.checkbox("Sin límite (uso administrativo)", key="new_area_sin_limite")
+        with c3:
             st.write("")
             if st.button("Agregar área"):
                 if nueva_area_nombre.strip():
                     try:
-                        add_area(nueva_area_nombre.strip())
+                        add_area(nueva_area_nombre.strip(), nueva_area_sin_limite)
                         st.success("Área agregada.")
                         st.rerun()
                     except sqlite3.IntegrityError:
                         st.error("Ya existe un área con ese nombre.")
                 else:
                     st.error("Escribe un nombre para el área.")
+
+        if not areas_df.empty:
+            st.markdown("**Marcar / desmarcar un área como sin límite**")
+            c1, c2, c3 = st.columns([3, 2, 1])
+            with c1:
+                area_toggle = st.selectbox("Área", areas_df["nombre"].tolist(), key="area_toggle_sin_limite")
+            with c2:
+                valor_actual = bool(areas_df.loc[areas_df["nombre"] == area_toggle, "sin_limite"].iloc[0])
+                nuevo_valor = st.checkbox("Sin límite (uso administrativo)", value=valor_actual, key="area_toggle_valor")
+            with c3:
+                st.write("")
+                if st.button("Actualizar"):
+                    set_area_sin_limite(area_toggle, nuevo_valor)
+                    st.success("Área actualizada.")
+                    st.rerun()
 
         st.markdown("**Eliminar área**")
         if not areas_df.empty:
@@ -1610,6 +1696,40 @@ elif pagina == "Administración":
                 st.success("Reserva eliminada.")
                 st.rerun()
 
+        st.divider()
+        st.subheader("🔧 Crear o recrear una reserva manualmente")
+        st.caption(
+            "Esta es la vía para usar áreas 'sin límite' (no aparecen en el formulario público) y "
+            "para recuperar una reserva que se perdió. Deja el código en blanco para crear una nueva "
+            "(se genera uno automático), o escribe el código que ya le había llegado por correo a "
+            "alguien si estás recuperando una reserva perdida. Aquí no se valida ningún cupo."
+        )
+        with st.form("form_recrear_reserva", clear_on_submit=True):
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                r_codigo = st.text_input("Código (déjalo vacío para generar uno nuevo)")
+                r_nombre = st.text_input("Nombre del solicitante")
+                r_correo = st.text_input("Correo del solicitante")
+                r_area = st.selectbox("Área", get_areas()["nombre"].tolist())
+            with rc2:
+                r_fecha = st.date_input("Fecha", value=hoy_cdmx())
+                r_cantidad = st.number_input("Cantidad de boletos", min_value=1, value=1, step=1)
+                r_estado = st.selectbox("Estado", ["pendiente", "aprobada", "rechazada"])
+                r_comentario = st.text_input("Nota (opcional)")
+
+            if st.form_submit_button("Guardar reserva"):
+                if not r_nombre.strip() or not r_correo.strip():
+                    st.error("Nombre y correo son obligatorios.")
+                else:
+                    ok, msg = crear_reserva_con_codigo(
+                        r_codigo, r_fecha, r_area, int(r_cantidad), r_comentario,
+                        r_nombre.strip(), r_correo.strip(), r_estado,
+                    )
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
     # --- Respaldo y exportar ---
     with tab_respaldo:
         st.subheader("Respaldo completo de la base de datos")
@@ -1627,6 +1747,32 @@ elif pagina == "Administración":
             )
         except FileNotFoundError:
             st.warning("Todavía no se ha creado la base de datos (no hay nada que respaldar).")
+
+        st.divider()
+        st.subheader("🔄 Restaurar desde un respaldo")
+        st.warning(
+            "Esto **reemplaza todos los datos actuales** (reservas, áreas, reglas, todo) con lo que "
+            "venga en el archivo que subas. Solo úsalo si necesitas recuperar un respaldo anterior."
+        )
+        archivo_respaldo = st.file_uploader("Sube un archivo .db de respaldo", type=["db"], key="subir_respaldo")
+        if archivo_respaldo is not None:
+            confirmar_restaurar = st.checkbox(
+                "Entiendo que esto borra y reemplaza todos los datos actuales de la app."
+            )
+            if st.button("Restaurar este respaldo", type="primary", disabled=not confirmar_restaurar):
+                try:
+                    contenido = archivo_respaldo.read()
+                    conn_prueba = sqlite3.connect(":memory:")
+                    conn_prueba.close()
+                    with open(DB_PATH, "wb") as f:
+                        f.write(contenido)
+                    conn_verificacion = get_conn()
+                    conn_verificacion.execute("SELECT COUNT(*) FROM reservas")
+                    conn_verificacion.close()
+                    st.success("¡Respaldo restaurado! La app ya está usando estos datos.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo restaurar: el archivo no parece un respaldo válido. ({e})")
 
         st.divider()
 
