@@ -139,6 +139,7 @@ def init_db():
         "columnas_invitados": json.dumps(COLUMNAS_DEFAULT, ensure_ascii=False),
         "campos_desglose": json.dumps(CAMPOS_DESGLOSE_DEFAULT, ensure_ascii=False),
         "dias_bloqueados": "[]",
+        "cupos_especiales": "{}",
         "correos_notificacion": json.dumps(CORREOS_NOTIFICACION_DEFAULT, ensure_ascii=False),
     }
     for k, v in defaults.items():
@@ -217,6 +218,37 @@ def bloquear_dia(fecha):
 def desbloquear_dia(fecha):
     dias = [d for d in get_dias_bloqueados() if d != str(fecha)]
     set_rule("dias_bloqueados", json.dumps(dias, ensure_ascii=False))
+
+
+def get_cupos_especiales():
+    raw = get_rule("cupos_especiales")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def set_cupo_especial(fecha, cupo):
+    cupos = get_cupos_especiales()
+    cupos[str(fecha)] = int(cupo)
+    set_rule("cupos_especiales", json.dumps(cupos, ensure_ascii=False))
+
+
+def quitar_cupo_especial(fecha):
+    cupos = get_cupos_especiales()
+    cupos.pop(str(fecha), None)
+    set_rule("cupos_especiales", json.dumps(cupos, ensure_ascii=False))
+
+
+def capacidad_dia(fecha):
+    """Cupo efectivo de un día: el especial si se configuró uno para esa fecha, si no el general."""
+    cupos = get_cupos_especiales()
+    valor_especial = cupos.get(str(fecha))
+    if valor_especial is not None:
+        return int(valor_especial)
+    return int(get_rule("capacidad_diaria_total", 70))
 
 
 def get_correos_notificacion():
@@ -406,7 +438,7 @@ def editar_cantidad_reserva(reserva_id, nueva_cantidad):
         return True, "No hubo cambios (la cantidad ya era esa)."
 
     if estado == "aprobada":
-        capacidad_total = int(get_rule("capacidad_diaria_total", 70))
+        capacidad_total = capacidad_dia(fecha)
         aprobado_otros = reservado_aprobado_en(fecha) - cantidad_actual
         disponible_otros = capacidad_total - aprobado_otros
         if nueva_cantidad > disponible_otros:
@@ -472,7 +504,7 @@ def aprobar_reserva(reserva_id):
     if str(fecha) in get_dias_bloqueados():
         conn.close()
         return False, f"El día {fecha} está bloqueado por el organizador. No se puede aprobar."
-    capacidad_total = int(get_rule("capacidad_diaria_total", 70))
+    capacidad_total = capacidad_dia(fecha)
     aprobado_actual = reservado_aprobado_en(fecha)
     disponible = capacidad_total - aprobado_actual
     if cantidad > disponible:
@@ -540,16 +572,16 @@ def estado_color_dia(disponible, capacidad_total, bloqueado):
 
 
 def render_calendario_semaforo(fecha_min, fecha_max):
-    capacidad_total = int(get_rule("capacidad_diaria_total", 70))
     dias_bloqueados = get_dias_bloqueados()
 
     filas_html = []
     dia = fecha_min
     while dia <= fecha_max:
         bloqueado = str(dia) in dias_bloqueados
+        capacidad_dia_actual = capacidad_dia(dia)
         aprobado = reservado_aprobado_en(dia)
-        disponible = max(0, capacidad_total - aprobado)
-        emoji, color, etiqueta = estado_color_dia(disponible, capacidad_total, bloqueado)
+        disponible = max(0, capacidad_dia_actual - aprobado)
+        emoji, color, etiqueta = estado_color_dia(disponible, capacidad_dia_actual, bloqueado)
         filas_html.append(
             f"<div style='display:flex; align-items:center; gap:8px; padding:6px 12px; "
             f"margin-bottom:4px; border-radius:8px; background:{color}1A; border-left:4px solid {color};'>"
@@ -955,8 +987,8 @@ if pagina == "Solicitar reserva":
     fecha_max = hoy + timedelta(days=max_dias)
 
     st.caption(
-        f"📌 Cupo de {capacidad_total} boletos por día · puedes solicitar entre "
-        f"{fecha_dia_mes_es(fecha_min)} y {fecha_dia_mes_es(fecha_max)} · "
+        f"📌 Cupo base de {capacidad_total} boletos por día (puede ser distinto en días especiales) · "
+        f"puedes solicitar entre {fecha_dia_mes_es(fecha_min)} y {fecha_dia_mes_es(fecha_max)} · "
         f"máximo {max_por_reserva} boletos por área, por día (entre todas tus solicitudes)."
     )
     st.info(
@@ -983,8 +1015,9 @@ if pagina == "Solicitar reserva":
         fecha_sel = st.date_input("Fecha en la que quieres usar los boletos", value=fecha_min, min_value=fecha_min, max_value=fecha_max)
 
     dia_bloqueado = str(fecha_sel) in get_dias_bloqueados()
+    capacidad_dia_sel = capacidad_dia(fecha_sel)
     aprobado_dia = reservado_aprobado_en(fecha_sel)
-    disponible_dia = max(0, capacidad_total - aprobado_dia)
+    disponible_dia = max(0, capacidad_dia_sel - aprobado_dia)
 
     if dia_bloqueado:
         st.error(
@@ -993,13 +1026,13 @@ if pagina == "Solicitar reserva":
         )
     elif disponible_dia == 0:
         st.error(
-            f"El **{fecha_sel.strftime('%d/%m/%Y')}** ya alcanzó el cupo total de {capacidad_total} boletos. "
+            f"El **{fecha_sel.strftime('%d/%m/%Y')}** ya alcanzó el cupo total de {capacidad_dia_sel} boletos. "
             "No se pueden enviar más solicitudes para esta fecha."
         )
     else:
         st.info(
             f"Boletos ya **aprobados** para el **{fecha_sel.strftime('%d/%m/%Y')}**: "
-            f"**{aprobado_dia}** de {capacidad_total} · quedan **{disponible_dia}** disponibles."
+            f"**{aprobado_dia}** de {capacidad_dia_sel} · quedan **{disponible_dia}** disponibles."
         )
 
         es_area_sin_limite = area_es_sin_limite(area_sel)
@@ -1206,9 +1239,8 @@ elif pagina == "Dashboard 🔒":
         st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
         st.stop()
 
-    capacidad_diaria_total = int(get_rule("capacidad_diaria_total", 70))
     num_dias = (fecha_fin - fecha_ini).days + 1
-    capacidad_total_rango = capacidad_diaria_total * num_dias
+    capacidad_total_rango = sum(capacidad_dia(fecha_ini + timedelta(days=i)) for i in range(num_dias))
 
     df_todas = get_reservas(fecha_ini, fecha_fin)
     df_aprobadas = df_todas[df_todas["estado"] == "aprobada"] if not df_todas.empty else df_todas
@@ -1279,8 +1311,8 @@ elif pagina == "Administración":
         if df_pend.empty:
             st.info("No hay solicitudes pendientes. 🎉")
         else:
-            capacidad_total = int(get_rule("capacidad_diaria_total", 70))
             for _, row in df_pend.iterrows():
+                capacidad_total = capacidad_dia(row["fecha"])
                 aprobado_dia = reservado_aprobado_en(row["fecha"])
                 disponible_dia = max(0, capacidad_total - aprobado_dia)
                 with st.container(border=True):
@@ -1385,6 +1417,47 @@ elif pagina == "Administración":
                 if st.button("✅ Desbloquear"):
                     desbloquear_dia(dia_desbloquear)
                     st.success(f"{dia_desbloquear} quedó desbloqueado.")
+                    st.rerun()
+
+        st.divider()
+        st.subheader("Cupos especiales por día")
+        st.caption(
+            "El cupo base aplica a todos los días por igual. Aquí puedes darle a un día específico "
+            "un cupo distinto (más alto o más bajo) sin afectar a los demás días."
+        )
+
+        cupos_especiales = get_cupos_especiales()
+        if cupos_especiales:
+            tabla_cupos = pd.DataFrame(
+                [{"Día": fecha, "Cupo especial": cupo} for fecha, cupo in sorted(cupos_especiales.items())]
+            )
+            st.dataframe(tabla_cupos, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No hay cupos especiales configurados todavía — todos los días usan el cupo base.")
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            fecha_cupo_especial = st.date_input("Día", value=hoy_cdmx(), key="fecha_cupo_especial")
+        with c2:
+            valor_cupo_especial = st.number_input(
+                "Cupo para ese día", min_value=0, value=int(get_rule("capacidad_diaria_total", 70)), key="valor_cupo_especial"
+            )
+        with c3:
+            st.write("")
+            if st.button("💾 Guardar cupo especial"):
+                set_cupo_especial(fecha_cupo_especial, valor_cupo_especial)
+                st.success(f"El {fecha_cupo_especial} ahora tiene un cupo de {valor_cupo_especial}.")
+                st.rerun()
+
+        if cupos_especiales:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                dia_quitar_cupo = st.selectbox("Quitar cupo especial de este día", sorted(cupos_especiales.keys()), key="dia_quitar_cupo")
+            with c2:
+                st.write("")
+                if st.button("↩️ Volver al cupo base"):
+                    quitar_cupo_especial(dia_quitar_cupo)
+                    st.success(f"{dia_quitar_cupo} vuelve a usar el cupo base.")
                     st.rerun()
 
         st.divider()
