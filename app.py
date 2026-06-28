@@ -867,6 +867,25 @@ def enviar_correo_cantidad_modificada(destinatario, nombre, codigo, fecha, area,
     return _enviar_correo(destinatario, f"Tu reserva fue actualizada - código {codigo}", cuerpo)
 
 
+def enviar_correo_recordatorio_excel(destinatario, nombre, codigo, fecha, area, cantidad):
+    """Recordatorio para una reserva ya aprobada que todavía no sube su lista de invitados."""
+    cuerpo = (
+        f"Hola {nombre},<br><br>"
+        "Te escribimos para recordarte que tu solicitud de boletos para el Fan Fest ya fue "
+        "<b>aprobada</b>, pero todavía no hemos recibido la lista de tus invitados.<br><br>"
+        f"Código de reserva: {codigo}<br>"
+        f"Fecha: {fecha}<br>"
+        f"Área: {area}<br>"
+        f"Cantidad de boletos: {cantidad}<br><br>"
+        "Por favor entra a la app, ve a 'Mi reserva', pon tu código y sube la lista detallada "
+        "con el nombre completo de cada uno de tus invitados lo antes posible.<br><br>"
+        f"Sigue tu reserva <a href=\"{APP_URL}\">aquí</a>.<br><br>"
+        f"{PIE_CONTACTO.replace(chr(10), '<br>')}<br><br>"
+        "Este es un correo automático, por favor no respondas a este mensaje."
+    )
+    return _enviar_correo(destinatario, f"Recordatorio: falta tu lista de invitados - código {codigo}", cuerpo, es_html=True)
+
+
 def enviar_correo_notificacion_admin(codigo, nombre_solicitante, correo_solicitante, fecha, area, cantidad):
     """Avisa a los correos configurados en Administración que llegó una nueva solicitud para revisar."""
     destinatarios = get_correos_notificacion()
@@ -1651,6 +1670,39 @@ elif pagina == "Administración":
         columnas_mostrar = ["id", "codigo", "fecha", "area", "cantidad", "estado", "solicitante_nombre", "solicitante_correo", "comentario"]
         st.dataframe(df[columnas_mostrar] if not df.empty else df, hide_index=True, use_container_width=True)
 
+        df_aprobadas_rango = get_reservas(
+            f_ini, f_fin, None if area_filtro == "Todas" else area_filtro, estado="aprobada"
+        )
+        if not df_aprobadas_rango.empty:
+            sin_excel = df_aprobadas_rango[
+                ~df_aprobadas_rango["lista_invitados"].apply(lambda v: isinstance(v, str) and bool(v.strip()))
+            ]
+            if not sin_excel.empty:
+                st.warning(
+                    f"📋 Hay {len(sin_excel)} reserva(s) aprobada(s) en este rango que todavía no han "
+                    "subido su lista de invitados."
+                )
+                if st.button(f"📧 Enviar recordatorio a estas {len(sin_excel)} reserva(s)", key="btn_recordatorio_masivo"):
+                    enviados, sin_correo, fallidos = 0, 0, 0
+                    for _, fila_r in sin_excel.iterrows():
+                        if not fila_r.get("solicitante_correo"):
+                            sin_correo += 1
+                            continue
+                        ok, _ = enviar_correo_recordatorio_excel(
+                            fila_r["solicitante_correo"], fila_r.get("solicitante_nombre") or "",
+                            fila_r["codigo"], fila_r["fecha"], fila_r["area"], fila_r["cantidad"],
+                        )
+                        if ok:
+                            enviados += 1
+                        else:
+                            fallidos += 1
+                    resumen = f"Recordatorios enviados: {enviados}."
+                    if fallidos:
+                        resumen += f" No se pudieron enviar: {fallidos}."
+                    if sin_correo:
+                        resumen += f" Sin correo registrado: {sin_correo}."
+                    st.success(resumen)
+
         if not df.empty:
             st.markdown("**Ver detalle / cancelar una reserva**")
             id_sel = st.selectbox("ID de la reserva", df["id"].tolist())
@@ -1684,6 +1736,16 @@ elif pagina == "Administración":
                 )
             else:
                 st.caption("Esta reserva todavía no tiene lista de invitados subida.")
+                if fila["estado"] == "aprobada" and fila.get("solicitante_correo"):
+                    if st.button("📧 Enviar recordatorio de subir Excel", key=f"recordatorio_{id_sel}"):
+                        ok, msg = enviar_correo_recordatorio_excel(
+                            fila["solicitante_correo"], fila.get("solicitante_nombre") or "",
+                            fila["codigo"], fila["fecha"], fila["area"], fila["cantidad"],
+                        )
+                        if ok:
+                            st.success(f"Recordatorio enviado a {fila['solicitante_correo']}.")
+                        else:
+                            st.error(msg)
 
             st.markdown("**Modificar cantidad de boletos**")
             st.caption(
